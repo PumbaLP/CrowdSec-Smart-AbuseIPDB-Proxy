@@ -1,0 +1,42 @@
+type: http
+name: abuseipdb_default
+log_level: info
+format: |
+  {{$alert := index . 0}}
+  {{$scenario := lower $alert.Scenario}}
+  {
+    "ip": "{{$alert.Source.IP}}",
+    "categories": "
+      {{- if contains "ssh" $scenario -}} 18,22
+      {{- else if contains "telnet" $scenario -}} 18,23
+      {{- else if or (contains "ftp" $scenario) (contains "vsftpd" $scenario) -}} 5,18
+      {{- else if contains "mysql" $scenario -}} 18
+      {{- else if or (contains "pop3" $scenario) (contains "imap" $scenario) (contains "dovecot" $scenario) -}} 18
+      {{- else if contains "spam" $scenario -}} 11
+      {{- else if contains "sqli" $scenario -}} 16,21
+      {{- else if contains "xss" $scenario -}} 21
+      {{- else if contains "path-traversal" $scenario -}} 21
+      {{- else if contains "open-proxy" $scenario -}} 9
+      {{- else if contains "backdoor" $scenario -}} 15,20
+      {{- else if contains "bad-user-agent" $scenario -}} 19
+      {{- else if or (contains "sensitive-files" $scenario) (contains "probing" $scenario) -}} 21
+      {{- else if contains "scan" $scenario -}} 14
+      {{- else if contains "crawl" $scenario -}} 19
+      {{- else if or (contains "ddos" $scenario) (contains "dos" $scenario) -}} 4
+      {{- else if or (contains "bruteforce" $scenario) (contains "-bf" $scenario) -}} 18
+      {{- else if contains "cve" $scenario -}} 15,21
+      {{- else if contains "http" $scenario -}} 21
+      {{- else if contains "exploit" $scenario -}} 15,21
+      {{- else -}} 15 {{- end -}}
+    ",
+    "comment": "CrowdSec blocked IP for {{$alert.Scenario}} on {{$alert.MachineID}}"
+  }
+url: http://127.0.0.1:9999/
+method: POST
+headers:
+  Content-Type: "application/json"
+  # Only needed if ABUSEIPDB_SHARED_SECRET is set on the proxy side (see
+  # abuseipdb-proxy.env.example) — an extra layer on top of
+  # ABUSEIPDB_LISTEN_ADDRESS/ABUSEIPDB_ALLOWED_SOURCE_IPS, mainly useful
+  # when the proxy isn't loopback-only. Leave commented out otherwise.
+  # X-Proxy-Secret: "your-shared-secret-here"

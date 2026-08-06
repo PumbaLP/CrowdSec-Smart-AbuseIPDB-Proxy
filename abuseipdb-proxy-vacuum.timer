@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly SQLite cache vacuum for CrowdSec Smart AbuseIPDB Proxy
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,28 @@
+[Unit]
+Description=CrowdSec Smart AbuseIPDB Proxy
+After=network.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/abuseipdb-proxy/abuseipdb-proxy.env
+ExecStart=/usr/local/bin/abuseipdb_proxy.py
+Restart=always
+RestartSec=5
+
+# Minor hardening, since this service handles an API key
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/abuseipdb-proxy
+
+# Safety net against journal/disk flooding under high alert volume (e.g.
+# a honeypot under active attack). This caps at 200 lines per 30s and
+# drops the rest (journald logs how many were suppressed) — independent
+# of the app's own quieter default logging, so a logging bug here can't
+# fill the disk either.
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=200
+
+[Install]
+WantedBy=multi-user.target

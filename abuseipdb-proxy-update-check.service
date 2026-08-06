@@ -1,0 +1,16 @@
+[Unit]
+Description=CrowdSec Smart AbuseIPDB Proxy - update check
+# Best-effort: never take the actual proxy down or block on it.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+# Needed so update.sh's --notify call can actually reach your configured
+# Gotify/ntfy/webhook backend — same env file the main service uses.
+EnvironmentFile=/etc/abuseipdb-proxy/abuseipdb-proxy.env
+# ExecStart is rewritten by install.sh to point at the update.sh inside
+# your actual git checkout (the path varies per install, so it can't be
+# hardcoded here).
+ExecStart=/bin/true

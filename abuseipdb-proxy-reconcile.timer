@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly CrowdSec decision reconciliation for CrowdSec Smart AbuseIPDB Proxy
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target

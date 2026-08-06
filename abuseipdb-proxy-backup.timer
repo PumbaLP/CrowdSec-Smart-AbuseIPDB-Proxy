@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily cache backup for CrowdSec Smart AbuseIPDB Proxy
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

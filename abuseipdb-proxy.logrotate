@@ -1,0 +1,19 @@
+# Only needed if you've deliberately redirected the proxy's own output to
+# a file (e.g. `abuseipdb_proxy.py > /var/log/abuseipdb-proxy.log 2>&1`)
+# instead of letting systemd/journald or Docker's log driver handle it —
+# both of those already rotate on their own, so this file does nothing
+# useful for the default install.sh setup and isn't installed by it.
+#
+# To use it:
+#   sudo cp abuseipdb-proxy.logrotate /etc/logrotate.d/abuseipdb-proxy
+#   sudo logrotate --debug /etc/logrotate.d/abuseipdb-proxy   # dry run, check the path below matches yours
+
+/var/log/abuseipdb-proxy.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

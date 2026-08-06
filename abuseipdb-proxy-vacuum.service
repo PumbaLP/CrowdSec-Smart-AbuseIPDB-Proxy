@@ -1,0 +1,12 @@
+[Unit]
+Description=CrowdSec Smart AbuseIPDB Proxy - SQLite cache vacuum
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+# Unlike abuseipdb-proxy-update-check.service, this path never needs
+# rewriting per-checkout — /usr/local/bin/abuseipdb_proxy.py is always
+# where install.sh puts the installed binary, regardless of where the
+# git checkout itself lives.
+ExecStart=/usr/local/bin/abuseipdb_proxy.py --vacuum

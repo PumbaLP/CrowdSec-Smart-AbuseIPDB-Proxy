@@ -1,0 +1,10 @@
+[Unit]
+Description=CrowdSec Smart AbuseIPDB Proxy - cache backup
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+# Same fixed path reasoning as abuseipdb-proxy-vacuum.service — this
+# never needs rewriting per-checkout.
+ExecStart=/usr/local/bin/abuseipdb_proxy.py --backup

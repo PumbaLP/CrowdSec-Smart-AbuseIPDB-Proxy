@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily update check for CrowdSec Smart AbuseIPDB Proxy
+
+[Timer]
+OnCalendar=daily
+# Catch up on missed runs (e.g. host was off) instead of silently skipping.
+Persistent=true
+# Spread load a little instead of every host hitting GitHub at exactly
+# midnight.
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

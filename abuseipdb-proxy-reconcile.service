@@ -1,0 +1,11 @@
+[Unit]
+Description=CrowdSec Smart AbuseIPDB Proxy - CrowdSec decision reconciliation
+After=network.target crowdsec.service
+
+[Service]
+Type=oneshot
+User=root
+# Same fixed-path reasoning as abuseipdb-proxy-vacuum.service — this
+# never needs rewriting per-checkout. No-op (exits 1 with a clear log
+# line) unless ABUSEIPDB_CROWDSEC_BOUNCER_KEY is set in the env file.
+ExecStart=/usr/local/bin/abuseipdb_proxy.py --reconcile

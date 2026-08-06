@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.pytest_cache/
+.coverage
+coverage.xml
+coverage-report.txt
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local runtime artifacts (should never actually live in the repo,
+# but just in case someone tests the proxy locally)
+*.tmp
+cache.json
+cache.json.migrated
+cache.db
+cache.db-wal
+cache.db-shm
+*.quota.json
+*.quota.json.tmp
+abuseipdb-proxy.env
+docker-compose.env
