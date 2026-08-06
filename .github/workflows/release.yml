@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Extract release title and notes from CHANGELOG.md
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          python3 - "$VERSION" << 'PYEOF'
+          import os
+          import re
+          import sys
+
+          version = sys.argv[1]
+          repo = os.environ["GITHUB_REPOSITORY"]
+
+          with open("CHANGELOG.md") as f:
+              content = f.read()
+
+          # Matches "## [1.3.0] - Some subtitle" up to the next "## [" header (or EOF)
+          pattern = (
+              r"^## \[" + re.escape(version) + r"\](?: - (?P<subtitle>[^\n]*))?\n"
+              r"(?P<body>.*?)(?=\n## \[|\Z)"
+          )
+          match = re.search(pattern, content, re.DOTALL | re.MULTILINE)
+
+          if not match:
+              print(
+                  f"::error::No CHANGELOG.md entry found for version {version}. "
+                  f"Add a '## [{version}]' section before tagging.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          subtitle = match.group("subtitle")
+          title = f"v{version} \u2013 {subtitle}" if subtitle else f"v{version}"
+          body = match.group("body").strip()
+
+          with open("release_title.txt", "w") as f:
+              f.write(title)
+
+          with open("release_notes.md", "w") as f:
+              f.write(body)
+              f.write(f"\n\n---\n\U0001F4C4 Full history: [CHANGELOG.md](https://github.com/{repo}/blob/main/CHANGELOG.md)\n")
+          PYEOF
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="$(cat release_title.txt)"
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "$TITLE" \
+            --notes-file release_notes.md \
+            Docker/docker-compose.yml \
+            Docker/docker-compose.env.example

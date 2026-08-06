@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.x"
+
+      - name: ShellCheck
+        run: shellcheck install.sh update.sh uninstall.sh
+
+      - name: Check Python syntax
+        run: python3 -m py_compile abuseipdb_proxy.py
+
+      - name: Validate systemd unit syntax
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq systemd
+          systemd-analyze verify abuseipdb-proxy.service || true
+          systemd-analyze verify abuseipdb-proxy-update-check.service abuseipdb-proxy-update-check.timer || true
+          systemd-analyze verify abuseipdb-proxy-vacuum.service abuseipdb-proxy-vacuum.timer || true
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.x"
+
+      - name: Install test dependencies
+        run: pip install -r tests/requirements.txt
+
+      - name: Run test suite with coverage
+        run: |
+          pytest --cov=. --cov-report=term-missing --cov-report=xml \
+            | tee coverage-report.txt
+
+      - name: Add coverage to job summary
+        if: always()
+        run: |
+          {
+            echo "### Coverage"
+            echo '```'
+            grep -A 100 "^Name " coverage-report.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build image
+        run: docker build -f Docker/Dockerfile -t abuseipdb-proxy:ci .
+
+      - name: Report image size
+        run: |
+          docker image inspect abuseipdb-proxy:ci --format '{{.Size}}' | awk '{printf "Image size: %.1f MB\n", $1/1024/1024}'
+
+      - name: Verify sqlite3 actually works in the image
+        run: |
+          docker run --rm --entrypoint python3 abuseipdb-proxy:ci \
+            -c "import sqlite3; print('sqlite3 OK:', sqlite3.sqlite_version)"
+
+      - name: Verify the proxy itself starts and responds (--version)
+        run: docker run --rm abuseipdb-proxy:ci --version
+
+      - name: Verify --dry-run boots the HTTP server and /health responds
+        run: |
+          docker run -d --name abuseipdb-ci-smoketest \
+            -e ABUSEIPDB_DRY_RUN=true \
+            -p 127.0.0.1:19999:9999 \
+            abuseipdb-proxy:ci
+          for i in $(seq 1 10); do
+            if curl -sf http://127.0.0.1:19999/health; then break; fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:19999/health
+          docker logs abuseipdb-ci-smoketest
+          docker rm -f abuseipdb-ci-smoketest
