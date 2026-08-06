@@ -1,0 +1,54 @@
+name: Bug report
+description: Something isn't working as expected
+labels: ["bug"]
+body:
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What actually happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: |
+        Output of `journalctl -u abuseipdb-proxy.service -n 100`.
+        Please redact your API key and any IPs you don't want public.
+      render: shell
+
+  - type: input
+    id: crowdsec-version
+    attributes:
+      label: CrowdSec version
+      description: Output of `cscli version`
+    validations:
+      required: false
+
+  - type: input
+    id: os
+    attributes:
+      label: OS / distro
+      placeholder: "e.g. Debian 13, Proxmox LXC"
+    validations:
+      required: false
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Non-default configuration
+      description: |
+        Any values you changed in abuseipdb-proxy.env, e.g.
+        ABUSEIPDB_REPORT_WINDOW or ABUSEIPDB_CACHE_FILE.
+    validations:
+      required: false
