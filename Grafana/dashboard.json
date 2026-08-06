@@ -1,0 +1,221 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "The Prometheus datasource scraping this proxy's /metrics endpoint",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "title": "CrowdSec Smart AbuseIPDB Proxy",
+  "description": "Reports sent/suppressed/failed, pending escalations/retries, AbuseIPDB quota, and uptime for CrowdSec-Smart-AbuseIPDB-Proxy. Requires ABUSEIPDB_ENABLE_METRICS=true and a Prometheus scrape job pointed at /metrics.",
+  "uid": "abuseipdb-proxy",
+  "tags": ["crowdsec", "abuseipdb", "security"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "1m",
+  "time": {"from": "now-24h", "to": "now"},
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Overview",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Version",
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "abuseipdb_proxy_info",
+          "legendFormat": "{{version}}",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"mappings": []}, "overrides": []},
+      "options": {
+        "graphMode": "none",
+        "colorMode": "none",
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "textMode": "name"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Uptime",
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "abuseipdb_proxy_uptime_seconds", "refId": "A"}
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "s", "mappings": []},
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "none",
+        "colorMode": "none",
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "AbuseIPDB Quota Remaining",
+      "description": "Resets 00:00 UTC. Unknown until the first report of the day is sent.",
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "abuseipdb_proxy_quota_remaining", "refId": "A"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 50},
+              {"color": "green", "value": 200}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "none",
+        "colorMode": "value",
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "AbuseIPDB Quota Limit",
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "abuseipdb_proxy_quota_limit", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"mappings": []}, "overrides": []},
+      "options": {
+        "graphMode": "none",
+        "colorMode": "none",
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Pending Escalations",
+      "gridPos": {"h": 4, "w": 4, "x": 16, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "abuseipdb_proxy_pending_escalations", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"mappings": []}, "overrides": []},
+      "options": {
+        "graphMode": "none",
+        "colorMode": "none",
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Pending Retries",
+      "gridPos": {"h": 4, "w": 4, "x": 20, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "abuseipdb_proxy_pending_retries", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"mappings": []}, "overrides": []},
+      "options": {
+        "graphMode": "none",
+        "colorMode": "none",
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      }
+    },
+    {
+      "id": 8,
+      "type": "row",
+      "title": "Report activity",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 5},
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Reports per minute",
+      "description": "Rate of each report outcome. A sustained rise in \"failed\" usually means AbuseIPDB is down, rate-limiting you, or the API key is bad.",
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 6},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "rate(abuseipdb_proxy_reports_sent_total[5m]) * 60", "legendFormat": "sent", "refId": "A"},
+        {"expr": "rate(abuseipdb_proxy_reports_suppressed_total[5m]) * 60", "legendFormat": "suppressed (dedup)", "refId": "B"},
+        {"expr": "rate(abuseipdb_proxy_reports_failed_total[5m]) * 60", "legendFormat": "failed (gave up)", "refId": "C"},
+        {"expr": "rate(abuseipdb_proxy_reports_ignored_private_total[5m]) * 60", "legendFormat": "ignored (private IP)", "refId": "D"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "pointSize": 5,
+            "spanNulls": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "failed (gave up)"},
+            "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]
+          },
+          {
+            "matcher": {"id": "byName", "options": "sent"},
+            "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]
+          }
+        ]
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom"},
+        "tooltip": {"mode": "multi"}
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "AbuseIPDB quota remaining (24h)",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 15},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {"expr": "abuseipdb_proxy_quota_remaining", "legendFormat": "remaining", "refId": "A"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {"drawStyle": "line", "fillOpacity": 15, "lineWidth": 2, "spanNulls": true}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom"},
+        "tooltip": {"mode": "single"}
+      }
+    }
+  ]
+}
