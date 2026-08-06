@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # Keeps the SHA-pinned GitHub Actions (see .github/workflows/) current —
+  # opens a PR bumping both the SHA and its version comment whenever a
+  # new release comes out. Works with SHA pins specifically because each
+  # `uses:` line carries a "# vX.Y.Z" comment Dependabot reads to know
+  # what's currently pinned.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  # Keeps the python:3.12-alpine base image in Docker/Dockerfile current.
+  - package-ecosystem: "docker"
+    directory: "/Docker"
+    schedule:
+      interval: "weekly"
+
+  # Keeps tests/requirements.txt (pytest, pytest-cov) current.
+  - package-ecosystem: "pip"
+    directory: "/tests"
+    schedule:
+      interval: "weekly"
