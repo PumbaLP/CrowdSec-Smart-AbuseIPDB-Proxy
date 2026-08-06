@@ -1,0 +1,89 @@
+services:
+  abuseipdb-proxy:
+    image: ghcr.io/pumbalp/crowdsec-smart-abuseipdb-proxy:latest
+    container_name: abuseipdb-proxy
+    restart: unless-stopped
+    env_file:
+      - docker-compose.env  # copy docker-compose.env.example -> docker-compose.env and fill in your key
+    environment:
+      ABUSEIPDB_ENABLE_METRICS: "true"
+    # Opts this container into Watchtower-based auto-updates — see the
+    # "Set and forget" section in the README for how to actually enable
+    # that (a separate, optional Watchtower container; disabled by
+    # default, since a scanner/reporting tool like this one auto-applying
+    # its own updates unattended isn't something to default to — same
+    # reasoning as update.sh --check-only never auto-applying either).
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    volumes:
+      - abuseipdb-cache:/var/lib/abuseipdb-proxy
+      # Optional: mount a secret file instead of putting the API key
+      # (or any other token — see docker-compose.env.example for the
+      # full list of {VAR}_FILE overrides this proxy understands) in
+      # plain text in docker-compose.env. A plain bind mount works fine
+      # here (no need for Compose's Swarm-oriented top-level "secrets:"
+      # construct); set the matching ABUSEIPDB_API_KEY_FILE=/run/secrets/
+      # abuseipdb_api_key in docker-compose.env and drop the plain
+      # ABUSEIPDB_API_KEY line there, they'd be redundant:
+      # - type: bind
+      #   source: ./secrets/abuseipdb_api_key.txt
+      #   target: /run/secrets/abuseipdb_api_key
+      #   read_only: true
+    # This is a single-threaded stdlib-only Python process handling
+    # occasional CrowdSec alerts — 64MB RAM / 0.25 CPU is already
+    # generous headroom, not a tight fit. Uncomment if you want a hard
+    # ceiling (e.g. on a resource-constrained host):
+    # mem_limit: 64m
+    # cpus: 0.25
+    # Not published to the host by default — CrowdSec should reach this
+    # container over the shared Docker network below, by service name
+    # (http://abuseipdb-proxy:9999), not via a published host port.
+    # Uncomment only if you specifically need host access (e.g. to hit
+    # /health or /metrics from outside Docker):
+    # ports:
+    #   - "127.0.0.1:9999:9999"
+    networks:
+      - default
+      # If CrowdSec runs in its own compose project, join its network too
+      # so it can resolve this container by name. Replace with your
+      # CrowdSec project's actual network name (usually
+      # "<crowdsec-project-dir-name>_default", check with `docker network ls`):
+      # - crowdsec_default
+
+volumes:
+  abuseipdb-cache:
+
+# networks:
+#   crowdsec_default:
+#     external: true
+
+# --- Set and forget: automatic updates via Watchtower ----------------------
+# Uncomment to have this container's image checked and pulled
+# automatically. Scoped to just this container via the
+# "com.centurylinklabs.watchtower.enable=true" label above (WATCHTOWER_LABEL_ENABLE
+# below), so it won't touch anything else Watchtower can see on this host.
+#
+# Defaults to WATCHTOWER_MONITOR_ONLY=true: sends a notification when an
+# update is available but does NOT apply it automatically — matching the
+# same philosophy as update.sh --check-only for the bare-metal install.
+# Uses the same alerting backend URL you already configured for the proxy
+# itself, via https://containrrr.dev/shoutrrr/ notification URLs (Slack/
+# Discord/Gotify/ntfy/generic webhook/... all supported — see the
+# shoutrrr docs for the exact URL format per service, it differs
+# slightly from this proxy's own ABUSEIPDB_* variables).
+#
+# Want it to actually auto-apply instead? Delete the
+# WATCHTOWER_MONITOR_ONLY line entirely (Watchtower auto-applies by
+# default when monitor-only isn't set).
+#
+#  watchtower:
+#    image: containrrr/watchtower
+#    container_name: watchtower
+#    restart: unless-stopped
+#    environment:
+#      WATCHTOWER_LABEL_ENABLE: "true"
+#      WATCHTOWER_MONITOR_ONLY: "true"
+#      WATCHTOWER_POLL_INTERVAL: "86400"  # once a day, same cadence as the bare-metal update-check timer
+#      WATCHTOWER_NOTIFICATION_URL: "gotify://gotify.example.com/TOKEN"
+#    volumes:
+#      - /var/run/docker.sock:/var/run/docker.sock
