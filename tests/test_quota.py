@@ -99,6 +99,32 @@ class TestLowQuotaWarning:
         assert calls[0][1] == "normal"
         assert "50" in calls[0][0] or "quota" in calls[0][0].lower()
 
+    def test_concurrent_breaches_only_notify_once(self, proxy, monkeypatch):
+        """Regression test: the check-then-set on _quota_warned_date used
+        to happen outside quota_lock, so many concurrent report threads
+        all crossing the threshold at once could each pass the check
+        before any of them set the flag, firing the notification
+        multiple times for the same day."""
+        import threading
+
+        calls = []
+        monkeypatch.setattr(proxy, "notify", lambda msg, priority="high": calls.append(1))
+
+        headers = FakeHeaders({"X-RateLimit-Limit": "1000", "X-RateLimit-Remaining": "10"})
+        barrier = threading.Barrier(20)
+
+        def hit():
+            barrier.wait()
+            proxy._update_quota_from_headers(headers)
+
+        threads = [threading.Thread(target=hit) for _ in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(calls) == 1
+
     def test_no_warning_while_comfortably_above_threshold(self, proxy, monkeypatch):
         calls = []
         monkeypatch.setattr(proxy, "notify", lambda msg, priority="high": calls.append(1))

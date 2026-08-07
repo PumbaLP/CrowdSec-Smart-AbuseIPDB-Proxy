@@ -75,6 +75,36 @@ def test_switch_to_fallback_key(make_proxy):
     assert p._switch_to_fallback_key("quota exhausted again") is False
 
 
+def test_concurrent_switches_only_notify_once(make_proxy, monkeypatch):
+    """Regression test: the 'already using fallback?' check used to run
+    before acquiring _active_key_lock, so many concurrent 429s could all
+    pass the check before any of them flipped the flag, each thinking it
+    was the one that switched (and each sending its own notification)."""
+    import threading
+
+    p = make_proxy(ABUSEIPDB_API_KEY_FALLBACK="fallback-key")
+    calls = []
+    monkeypatch.setattr(p, "notify", lambda msg, priority="high": calls.append(1))
+
+    results = []
+    barrier = threading.Barrier(20)
+
+    def hit():
+        barrier.wait()
+        results.append(p._switch_to_fallback_key("concurrent 429"))
+
+    threads = [threading.Thread(target=hit) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert results.count(True) == 1  # exactly one thread "won" the switch
+    assert results.count(False) == 19
+    assert len(calls) == 1
+    assert p._current_api_key() == "fallback-key"
+
+
 def test_reset_only_happens_on_a_new_utc_day(make_proxy):
     p = make_proxy(ABUSEIPDB_API_KEY_FALLBACK="fallback-key")
     p._switch_to_fallback_key("quota exhausted")
@@ -140,12 +170,16 @@ def test_reconcile_without_bouncer_key_errors(proxy):
 def test_reconcile_reports_only_missing_ips(make_proxy):
     p = make_proxy(ABUSEIPDB_CROWDSEC_BOUNCER_KEY="test-bouncer-key")
 
-    # 1.1.1.1 is already tracked; 2.2.2.2 is new; 3.3.3.3 is private (skipped)
+    # 1.1.1.1 is already tracked; 2.2.2.2 is new; 10.0.0.5 is private (skipped)
     cache = p.load_cache()
     cache["reports"]["1.1.1.1"] = {"time": int(p.time.time()), "severity": 1}
     p.save_cache(cache)
 
-    p.fetch_crowdsec_active_decisions = lambda: ["1.1.1.1", "2.2.2.2", "10.0.0.5"]
+    p.fetch_crowdsec_active_decisions = lambda: [
+        ("1.1.1.1", "crowdsecurity/ssh-bf"),
+        ("2.2.2.2", "crowdsecurity/ssh-bf"),
+        ("10.0.0.5", "crowdsecurity/ssh-bf"),
+    ]
 
     result = p.run_reconcile()
 
@@ -156,9 +190,49 @@ def test_reconcile_reports_only_missing_ips(make_proxy):
     assert "2.2.2.2" in p.load_cache()["reports"]
 
 
+def test_reconcile_uses_real_scenario_categories(make_proxy):
+    p = make_proxy(ABUSEIPDB_CROWDSEC_BOUNCER_KEY="test-bouncer-key")
+    p.fetch_crowdsec_active_decisions = lambda: [("2.2.2.2", "crowdsecurity/mysql-bf")]
+
+    sent = {}
+
+    def fake_send(ip, categories, comment):
+        sent["categories"] = categories
+        sent["comment"] = comment
+        return True, None
+
+    p.send_report_api = fake_send
+    p.run_reconcile()
+
+    assert sent["categories"] == "18"  # mysql -> 18, same as abuseipdb.yaml
+    assert "mysql-bf" in sent["comment"]
+    assert "reconciled" in sent["comment"].lower()
+
+
+def test_reconcile_falls_back_to_fixed_defaults_without_scenario(make_proxy):
+    p = make_proxy(
+        ABUSEIPDB_CROWDSEC_BOUNCER_KEY="test-bouncer-key",
+        ABUSEIPDB_RECONCILE_CATEGORIES="19",
+    )
+    p.fetch_crowdsec_active_decisions = lambda: [("2.2.2.2", "")]  # manually-added ban
+
+    sent = {}
+
+    def fake_send(ip, categories, comment):
+        sent["categories"] = categories
+        sent["comment"] = comment
+        return True, None
+
+    p.send_report_api = fake_send
+    p.run_reconcile()
+
+    assert sent["categories"] == "19"
+    assert "no scenario name" in sent["comment"]
+
+
 def test_reconcile_notifies_on_missing_ips(make_proxy, monkeypatch):
     p = make_proxy(ABUSEIPDB_CROWDSEC_BOUNCER_KEY="test-bouncer-key")
-    p.fetch_crowdsec_active_decisions = lambda: ["2.2.2.2"]
+    p.fetch_crowdsec_active_decisions = lambda: [("2.2.2.2", "crowdsecurity/ssh-bf")]
 
     calls = []
     monkeypatch.setattr(p, "notify", lambda message, priority="high": calls.append((message, priority)))
@@ -185,11 +259,10 @@ def test_reconcile_does_not_notify_when_nothing_missing(make_proxy, monkeypatch)
 
 def test_reconcile_notification_is_capped_for_large_batches(make_proxy, monkeypatch):
     p = make_proxy(ABUSEIPDB_CROWDSEC_BOUNCER_KEY="test-bouncer-key")
-    many_ips = [f"10.0.{i}.1" for i in range(30)]
     # 10.0.x.1 IPs are private and would be filtered by is_ignored_ip — use
     # public-looking ones instead so all 30 actually get reconciled
-    many_ips = [f"203.0.{i}.1" for i in range(30)]
-    p.fetch_crowdsec_active_decisions = lambda: many_ips
+    many = [(f"203.0.{i}.1", "crowdsecurity/ssh-bf") for i in range(30)]
+    p.fetch_crowdsec_active_decisions = lambda: many
 
     calls = []
     monkeypatch.setattr(p, "notify", lambda message, priority="high": calls.append((message, priority)))
@@ -231,9 +304,9 @@ def test_fetch_crowdsec_active_decisions_filters_non_ip_scope(make_proxy, monkey
     class FakeResponse:
         def read(self):
             return json.dumps([
-                {"value": "1.2.3.4", "scope": "Ip"},
-                {"value": "5.6.7.0/24", "scope": "Range"},
-                {"value": "8.8.8.8", "scope": "Ip"},
+                {"value": "1.2.3.4", "scope": "Ip", "scenario": "crowdsecurity/ssh-bf"},
+                {"value": "5.6.7.0/24", "scope": "Range", "scenario": "crowdsecurity/ssh-bf"},
+                {"value": "8.8.8.8", "scope": "Ip", "scenario": "crowdsecurity/mysql-bf"},
             ]).encode("utf-8")
         def __enter__(self):
             return self
@@ -242,7 +315,28 @@ def test_fetch_crowdsec_active_decisions_filters_non_ip_scope(make_proxy, monkey
 
     monkeypatch.setattr(p.urllib.request, "urlopen", lambda req, timeout=15: FakeResponse())
 
-    assert p.fetch_crowdsec_active_decisions() == ["1.2.3.4", "8.8.8.8"]
+    assert p.fetch_crowdsec_active_decisions() == [
+        ("1.2.3.4", "crowdsecurity/ssh-bf"),
+        ("8.8.8.8", "crowdsecurity/mysql-bf"),
+    ]
+
+
+def test_fetch_crowdsec_active_decisions_missing_scenario_is_empty_string(make_proxy, monkeypatch):
+    p = make_proxy(ABUSEIPDB_CROWDSEC_BOUNCER_KEY="test-bouncer-key")
+
+    class FakeResponse:
+        def read(self):
+            return json.dumps([
+                {"value": "1.2.3.4", "scope": "Ip"},  # no "scenario" key at all
+            ]).encode("utf-8")
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(p.urllib.request, "urlopen", lambda req, timeout=15: FakeResponse())
+
+    assert p.fetch_crowdsec_active_decisions() == [("1.2.3.4", "")]
 
 
 def test_fetch_crowdsec_active_decisions_handles_null_response(make_proxy, monkeypatch):
