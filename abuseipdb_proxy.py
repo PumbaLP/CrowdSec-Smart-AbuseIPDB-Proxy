@@ -28,7 +28,7 @@ import sys
 import threading
 from datetime import datetime, timezone
 
-VERSION = "2.7.0"
+VERSION = "2.8.0"
 
 START_TIME = time.time()
 
@@ -212,8 +212,65 @@ NOTIFY_ON_START = os.getenv("ABUSEIPDB_NOTIFY_ON_START", "false").strip().lower(
 # bouncer API key (`cscli bouncers add <name>`); off/inert without one.
 CROWDSEC_LAPI_URL = os.getenv("ABUSEIPDB_CROWDSEC_LAPI_URL", "http://127.0.0.1:8080").rstrip("/")
 CROWDSEC_BOUNCER_KEY = _get_secret("ABUSEIPDB_CROWDSEC_BOUNCER_KEY").strip()
+# Fallback only — used when a decision has no usable scenario name (e.g.
+# one added manually via `cscli decisions add`, which has no scenario at
+# all). Whenever a scenario name IS available, SCENARIO_CATEGORY_RULES
+# below is used instead, the same as a live alert would be.
 RECONCILE_SEVERITY = int(os.getenv("ABUSEIPDB_RECONCILE_SEVERITY", "2"))
 RECONCILE_CATEGORIES = os.getenv("ABUSEIPDB_RECONCILE_CATEGORIES", "15").strip()
+
+# This MUST stay in sync with abuseipdb.yaml's `format` template — same
+# substrings, same categories, same order (first match wins, exactly like
+# the Go template's if/else-if chain). It exists so --reconcile can
+# categorize a missing report the same way the live path would have,
+# instead of falling back to a fixed guess. tests/test_scenario_mapping.py
+# parses abuseipdb.yaml itself and cross-checks it against this list, so
+# the two can't silently drift apart.
+SCENARIO_CATEGORY_RULES = [
+    ("ssh", "18,22"),
+    ("telnet", "18,23"),
+    ("ftp", "5,18"),
+    ("vsftpd", "5,18"),
+    ("mysql", "18"),
+    ("pop3", "18"),
+    ("imap", "18"),
+    ("dovecot", "18"),
+    ("spam", "11"),
+    ("sqli", "16,21"),
+    ("xss", "21"),
+    ("path-traversal", "21"),
+    ("open-proxy", "9"),
+    ("backdoor", "15,20"),
+    ("bad-user-agent", "19"),
+    ("sensitive-files", "21"),
+    ("probing", "21"),
+    ("scan", "14"),
+    ("crawl", "19"),
+    ("ddos", "4"),
+    ("dos", "4"),
+    ("bruteforce", "18"),
+    ("-bf", "18"),
+    ("cve", "15,21"),
+    ("http", "21"),
+    ("exploit", "15,21"),
+]
+SCENARIO_CATEGORY_DEFAULT = "15"
+
+
+def categories_for_scenario(scenario):
+    """Same substring-match logic as abuseipdb.yaml's Go template: first
+    rule whose substring appears in the (lowercased) scenario name wins.
+    Returns None if `scenario` is empty/falsy, so the caller can tell
+    "no scenario available" apart from "no rule matched" (which still
+    returns the default categories, exactly like the template does)."""
+    if not scenario:
+        return None
+    scenario = scenario.lower()
+    for substring, categories in SCENARIO_CATEGORY_RULES:
+        if substring in scenario:
+            return categories
+    return SCENARIO_CATEGORY_DEFAULT
+
 
 # Off by default: querying AbuseIPDB's own /v2/check endpoint before every
 # report costs a separate daily quota from /v2/report, and adds a
@@ -594,7 +651,12 @@ SEVERITY_MAP = {
     "23": 2,  # IoT Targeted
 }
 
-lock = threading.Lock()
+# RLock, not Lock: process_alert() holds this for its entire decide-then-write
+# sequence and can call _schedule_pending() from inside that same block,
+# which itself needs to acquire this lock to be safe if ever called from
+# somewhere else in the future. A plain Lock would deadlock on that nested
+# acquire (same thread re-entering); RLock allows it.
+lock = threading.RLock()
 pending_timers = {}  # ip -> {"timer": threading.Timer, "severity": int}
 retry_timers = {}    # ip -> threading.Timer
 _cache_write_failing = False
@@ -959,6 +1021,7 @@ def _update_quota_from_headers(headers):
     if limit is None and remaining is None:
         return
     global _quota_warned_date
+    should_notify = False
     with quota_lock:
         try:
             if limit is not None:
@@ -969,19 +1032,27 @@ def _update_quota_from_headers(headers):
             return
         quota_state["updated_at"] = int(time.time())
         remaining_now = quota_state["remaining"]
+        limit_now = quota_state["limit"]
         _save_quota_state()
 
-    if remaining_now is not None and remaining_now <= QUOTA_WARN_THRESHOLD:
-        today = datetime.now(timezone.utc).date().isoformat()
-        if _quota_warned_date != today:
-            _quota_warned_date = today
-            log(f"AbuseIPDB daily quota is getting low: {remaining_now} report(s) remaining.",
-                level="warning", quota_remaining=remaining_now, quota_limit=quota_state["limit"])
-            notify(
-                f"AbuseIPDB daily quota is getting low: only {remaining_now} report(s) remaining "
-                f"today (limit {quota_state['limit']}). Resets at 00:00 UTC.",
-                priority="normal",
-            )
+        # Deciding *and* marking "already warned today" both happen while
+        # still holding quota_lock — otherwise two concurrent report
+        # threads could both see the old date, both flip it, and both
+        # fire the notification.
+        if remaining_now is not None and remaining_now <= QUOTA_WARN_THRESHOLD:
+            today = datetime.now(timezone.utc).date().isoformat()
+            if _quota_warned_date != today:
+                _quota_warned_date = today
+                should_notify = True
+
+    if should_notify:
+        log(f"AbuseIPDB daily quota is getting low: {remaining_now} report(s) remaining.",
+            level="warning", quota_remaining=remaining_now, quota_limit=limit_now)
+        notify(
+            f"AbuseIPDB daily quota is getting low: only {remaining_now} report(s) remaining "
+            f"today (limit {limit_now}). Resets at 00:00 UTC.",
+            priority="normal",
+        )
 
 
 _whitelist_cache_lock = threading.Lock()
@@ -1091,9 +1162,11 @@ def _switch_to_fallback_key(reason):
     configured and we weren't already using it) — the caller uses this to
     decide whether an immediate retry with the new key is worth it."""
     global _using_fallback_key, _fallback_switch_date
-    if not API_KEY_FALLBACK or _using_fallback_key:
+    if not API_KEY_FALLBACK:
         return False
     with _active_key_lock:
+        if _using_fallback_key:
+            return False  # already switched by another thread — nothing to do
         _using_fallback_key = True
         _fallback_switch_date = datetime.now(timezone.utc).date()
     log(f"Switching to fallback AbuseIPDB API key: {reason}", level="warning")
@@ -1248,21 +1321,24 @@ def _finalize_pending(ip, categories, comment, new_severity):
 def _schedule_pending(ip, categories, comment, new_severity, delay):
     """Schedules (or re-schedules) a delayed escalation report and persists
     it, so a proxy restart can pick it back up instead of silently
-    dropping it."""
-    timer = threading.Timer(delay, _finalize_pending, args=(ip, categories, comment, new_severity))
-    timer.daemon = True
-    pending_timers[ip] = {"timer": timer, "severity": new_severity}
-    timer.start()
+    dropping it. Acquires `lock` itself (it's an RLock, so this is safe
+    even when — as today — the only caller already holds it) rather than
+    relying on every future caller to remember to hold it first."""
+    with lock:
+        timer = threading.Timer(delay, _finalize_pending, args=(ip, categories, comment, new_severity))
+        timer.daemon = True
+        pending_timers[ip] = {"timer": timer, "severity": new_severity}
+        timer.start()
 
-    now = int(time.time())
-    cache = load_cache()
-    cache["pending"][ip] = {
-        "due_time": now + delay,
-        "severity": new_severity,
-        "categories": categories,
-        "comment": comment,
-    }
-    save_cache(cache)
+        now = int(time.time())
+        cache = load_cache()
+        cache["pending"][ip] = {
+            "due_time": now + delay,
+            "severity": new_severity,
+            "categories": categories,
+            "comment": comment,
+        }
+        save_cache(cache)
 
 
 def process_alert(ip, categories, comment, new_severity):
@@ -2152,10 +2228,12 @@ def run_backup(backup_dir=None):
 
 def fetch_crowdsec_active_decisions():
     """Queries CrowdSec's local API for currently active "ban" decisions,
-    the same endpoint bouncers poll. Returns a list of IP strings (only
-    scope=Ip decisions — range/country-scoped decisions aren't
-    single-IP reportable). Raises on any network/auth/parse failure;
-    callers decide how to handle that."""
+    the same endpoint bouncers poll. Returns a list of (ip, scenario)
+    tuples for scope=Ip decisions only (range/country-scoped decisions
+    aren't single-IP reportable). `scenario` is "" for decisions with no
+    scenario name (e.g. added manually via `cscli decisions add`).
+    Raises on any network/auth/parse failure; callers decide how to
+    handle that."""
     url = f"{CROWDSEC_LAPI_URL}/v1/decisions?type=ban"
     req = urllib.request.Request(url, headers={"X-Api-Key": CROWDSEC_BOUNCER_KEY, "Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=15) as resp:
@@ -2163,7 +2241,7 @@ def fetch_crowdsec_active_decisions():
     if not data:  # CrowdSec returns `null` (not `[]`) when there are no active decisions
         return []
     return [
-        d["value"] for d in data
+        (d["value"], d.get("scenario") or "") for d in data
         if d.get("value") and d.get("scope", "Ip").lower() == "ip"
     ]
 
@@ -2178,11 +2256,11 @@ def run_reconcile(as_json=False):
     dedup/escalation/quota-reservation/whitelist logic all still applies;
     an IP already tracked in the cache is left alone.
 
-    Reconciled reports use a fixed severity/category
-    (ABUSEIPDB_RECONCILE_SEVERITY/_CATEGORIES) rather than trying to
-    re-derive CrowdSec's own scenario-to-category mapping, since that
-    mapping lives in abuseipdb.yaml's Go template, not here — precision
-    isn't the point of this job, coverage is.
+    Categories/severity are derived from the decision's own scenario name
+    via categories_for_scenario()/get_severity() — the same categorization
+    a live alert for that scenario would have gotten. Only decisions with
+    no scenario name at all (manually-added bans) fall back to the fixed
+    ABUSEIPDB_RECONCILE_SEVERITY/_CATEGORIES.
     """
     if not CROWDSEC_BOUNCER_KEY:
         return {
@@ -2191,7 +2269,7 @@ def run_reconcile(as_json=False):
         }
 
     try:
-        active_ips = fetch_crowdsec_active_decisions()
+        active_decisions = fetch_crowdsec_active_decisions()
     except Exception as e:
         return {"error": f"Could not reach CrowdSec LAPI at {CROWDSEC_LAPI_URL}: {e}"}
 
@@ -2199,13 +2277,13 @@ def run_reconcile(as_json=False):
         cache = load_cache()
         known_ips = set(cache.get("reports", {}).keys())
 
-    checked = len(active_ips)
+    checked = len(active_decisions)
     already_known = 0
     skipped_ignored = 0
     reconciled = []
     threads = []
 
-    for ip in active_ips:
+    for ip, scenario in active_decisions:
         if ip in known_ips:
             already_known += 1
             continue
@@ -2215,12 +2293,23 @@ def run_reconcile(as_json=False):
         if is_whitelisted(ip):
             skipped_ignored += 1
             continue
-        t = process_alert(
-            ip, RECONCILE_CATEGORIES,
-            "Reconciled from an active CrowdSec decision the proxy had no record of reporting "
-            "(catch-up run, not a live detection).",
-            RECONCILE_SEVERITY,
-        )
+
+        categories = categories_for_scenario(scenario)
+        if categories is not None:
+            severity = get_severity(categories)
+            comment = (
+                f"CrowdSec blocked IP for {scenario} (reconciled — proxy had no record "
+                f"of reporting this)"
+            )
+        else:
+            categories = RECONCILE_CATEGORIES
+            severity = RECONCILE_SEVERITY
+            comment = (
+                "Reconciled from an active CrowdSec decision with no scenario name "
+                "(likely added manually) that the proxy had no record of reporting."
+            )
+
+        t = process_alert(ip, categories, comment, severity)
         if t:
             threads.append(t)
         reconciled.append(ip)
@@ -2527,6 +2616,20 @@ if __name__ == "__main__":
     if NOTIFY_ON_START:
         mode = "dry-run" if DRY_RUN else "live"
         notify(f"Started ({mode} mode).", priority="low")
-    server = http.server.HTTPServer((LISTEN_ADDRESS, LISTEN_PORT), AbuseIPDBHandler)
+    # ThreadingHTTPServer: one thread per connection instead of handling
+    # requests one at a time. Every module-level piece of state a request
+    # can touch (the report cache, pending/retry timers, quota tracking,
+    # the whitelist cache, the active-API-key switch) is guarded by its
+    # own lock — see the comment on `lock` above — specifically so this
+    # is safe. daemon_threads=True so in-flight request threads don't
+    # block a shutdown. request_queue_size raised from the default of 5:
+    # CrowdSec can fire several alerts in quick succession (e.g. a
+    # coordinated attack tripping multiple scenarios at once), and the
+    # default backlog is small enough that a real burst could get
+    # connections refused/reset before a thread is even spun up to
+    # accept them.
+    http.server.ThreadingHTTPServer.daemon_threads = True
+    http.server.ThreadingHTTPServer.request_queue_size = 128
+    server = http.server.ThreadingHTTPServer((LISTEN_ADDRESS, LISTEN_PORT), AbuseIPDBHandler)
     log(f"Listening on {LISTEN_ADDRESS}:{LISTEN_PORT}.", address=LISTEN_ADDRESS, port=LISTEN_PORT)
     server.serve_forever()

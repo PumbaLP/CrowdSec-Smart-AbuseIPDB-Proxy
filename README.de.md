@@ -249,8 +249,8 @@ Jede unten aufgeführte, secret-artige Variable (API-Key, Tokens, Webhook-URLs, 
 | `ABUSEIPDB_API_KEY_FALLBACK` | *(leer)* | Ein zweiter AbuseIPDB-API-Key, auf den umgeschaltet wird, sobald das Tageskontingent des Primär-Keys erschöpft ist (erkannt über einen HTTP-429 auf `/v2/report`). Schaltet automatisch zurück auf den Primär-Key, sobald erstmals ein neuer UTC-Tag beobachtet wird. |
 | `ABUSEIPDB_CROWDSEC_LAPI_URL` | `http://127.0.0.1:8080` | CrowdSecs lokale API-URL, nur von `--reconcile` genutzt |
 | `ABUSEIPDB_CROWDSEC_BOUNCER_KEY` | *(leer)* | Bouncer-API-Key für `--reconcile` (erstellen mit `cscli bouncers add <name>` auf dem CrowdSec-Host). `--reconcile` tut ohne diesen Wert nichts. |
-| `ABUSEIPDB_RECONCILE_SEVERITY` | `2` | Severity, die von `--reconcile` gefundenen fehlenden Reports zugewiesen wird |
-| `ABUSEIPDB_RECONCILE_CATEGORIES` | `15` | AbuseIPDB-Kategorien, die von `--reconcile` gefundenen fehlenden Reports zugewiesen werden (CrowdSecs eigenes Scenario-zu-Kategorie-Mapping lebt im Template von `abuseipdb.yaml`, nicht hier – Präzision ist nicht der Zweck der Reconciliation, Vollständigkeit schon) |
+| `ABUSEIPDB_RECONCILE_SEVERITY` | `2` | Fallback-Severity für `--reconcile`, nur genutzt, wenn eine Decision gar keinen Scenario-Namen hat (z. B. manuell via `cscli decisions add` hinzugefügt) – sonst wird die Severity aus dem echten Scenario abgeleitet, genau wie bei einem Live-Alert |
+| `ABUSEIPDB_RECONCILE_CATEGORIES` | `15` | Derselbe Fallback, für Kategorien |
 
 ## Logs
 
@@ -340,7 +340,7 @@ Den ausgegebenen Key als `ABUSEIPDB_CROWDSEC_BOUNCER_KEY` setzen, dann:
 python3 abuseipdb_proxy.py --reconcile
 ```
 
-Läuft durch dieselbe Dedup-/Eskalations-/Quota-Reservierungs-/Whitelist-Logik wie ein Live-Alert – eine bereits im Cache stehende IP wird nicht angefasst. Reconciled Reports bekommen eine feste Severity/Kategorie (`ABUSEIPDB_RECONCILE_SEVERITY`/`ABUSEIPDB_RECONCILE_CATEGORIES`, standardmäßig Severity 2 / Kategorie 15), statt zu versuchen, CrowdSecs Scenario-zu-Kategorie-Mapping nachzubilden – das lebt im Template von `abuseipdb.yaml`, nicht hier, also ist Präzision nicht wirklich der Zweck dieses Jobs; Vollständigkeit schon. Der Kommentar auf einem reconciled Report sagt das explizit dazu, damit in der eigenen AbuseIPDB-Historie klar erkennbar bleibt, welche Reports aus einer Live-Erkennung kamen und welche aus einem Catch-up-Lauf.
+Läuft durch dieselbe Dedup-/Eskalations-/Quota-Reservierungs-/Whitelist-Logik wie ein Live-Alert – eine bereits im Cache stehende IP wird nicht angefasst. Kategorien und Severity werden aus dem echten Scenario-Namen der CrowdSec-Decision abgeleitet, mit demselben Mapping, das auch `abuseipdb.yaml`s Template nutzt (synchron gehalten und gegengecheckt von `tests/test_scenario_mapping.py`) – ein reconciled Report wird also genauso kategorisiert wie ein Live-Alert es getan hätte. Nur Decisions ganz ohne Scenario-Namen (manuell via `cscli decisions add` hinzugefügt) fallen auf die feste `ABUSEIPDB_RECONCILE_SEVERITY`/`ABUSEIPDB_RECONCILE_CATEGORIES` zurück. So oder so steht im Kommentar eines reconciled Reports explizit, dass es ein Catch-up-Lauf war, damit in der eigenen AbuseIPDB-Historie klar erkennbar bleibt, welche Reports aus einer Live-Erkennung kamen und welche aus einer Reconciliation.
 
 Passt für einen periodischen Timer – `abuseipdb-proxy-reconcile.service`/`.timer` (standardmäßig stündlich) liegen in diesem Repo und werden von `install.sh` angeboten, sobald ein Bouncer-Key konfiguriert ist. Findet und meldet er etwas Fehlendes, schickt er zusätzlich eine Nachricht über die konfigurierten Alarm-Backends – sonst fällt ein still vor sich hin arbeitender Catch-up-Job leicht in Vergessenheit.
 
@@ -397,8 +397,6 @@ crowdsec-smart-abuseipdb/
 - Standardmäßig keine Authentifizierung auf dem lokalen Port – unkritisch, solange er nur auf `127.0.0.1` lauscht (der Docker-Default `0.0.0.0` ist unkritisch, gerade weil er innerhalb der Docker-eigenen Netzwerkisolation bleibt, siehe „Docker" oben). Für Setups, wo diese Grenze weniger klar ist, bieten `ABUSEIPDB_ALLOWED_SOURCE_IPS` und `ABUSEIPDB_SHARED_SECRET` optionale zusätzliche Schichten – siehe „Konfiguration" oben.
 - Das 15-Minuten-Standardfenster ist pro Severity-Stufe konfigurierbar (`ABUSEIPDB_REPORT_WINDOW_*`) und seit v2.5.0 auch pro Kategorie (`ABUSEIPDB_REPORT_WINDOW_CATEGORIES`) – aber weiterhin nicht pro einzelner IP.
 - Der Standard-SQLite-Cache skaliert komfortabel auch bei großer Report-Historie; das JSON-Backend (`ABUSEIPDB_CACHE_BACKEND=json`) reicht für typisches CrowdSec-Aufkommen, ist aber als flache, bei jedem Speichern neu geschriebene Datei nicht für extrem viele gleichzeitig getrackte IPs (Zehntausende) ausgelegt.
-- Der AbuseIPDB-Whitelist-Check (`ABUSEIPDB_SKIP_WHITELISTED`) läuft synchron im Request-Pfad – der HTTP-Server ist Single-Threaded, ein langsamer `/v2/check`-Call bei einem Cache-Miss verzögert also kurz den nächsten eingehenden Alert.
-- `--reconcile` leitet Severity/Kategorie für fehlende Reports über einen festen Default (`ABUSEIPDB_RECONCILE_SEVERITY`/`_CATEGORIES`) ab, nicht über CrowdSecs tatsächliches Scenario-zu-Kategorie-Mapping, da dieses im Go-Template von `abuseipdb.yaml` lebt, nicht in diesem Proxy.
 
 ## Contributing
 

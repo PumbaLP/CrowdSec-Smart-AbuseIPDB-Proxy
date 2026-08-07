@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here.
 
+## [2.8.0] - Concurrent request handling, precise reconciliation categorization
+
+Purely additive/fixes — no breaking changes.
+
+### Fixed
+- **Whitelist check (and everything else) no longer blocks concurrent requests**: switched from `http.server.HTTPServer` (handles one request at a time) to `http.server.ThreadingHTTPServer` (`daemon_threads=True`, `request_queue_size=128` — raised from the default of 5, since CrowdSec can fire several alerts in quick succession and a real burst could otherwise get connections refused before a thread even gets spun up to accept them). A slow `ABUSEIPDB_SKIP_WHITELISTED` `/v2/check` call — or any other slow request — used to delay every other alert queued behind it; now each connection gets its own thread. Removed the corresponding "known limitation" from the README.
+- **Two pre-existing race conditions**, both check-then-act patterns that ran partly outside their lock (latent since whenever they were introduced — more likely to actually manifest now that requests run concurrently by default):
+  - `_switch_to_fallback_key()`: the "already on the fallback?" check ran *before* acquiring `_active_key_lock`, so multiple concurrent 429s could each pass the check and each think they performed the switch, each firing its own notification. Fixed with a proper double-checked-locking pattern (check happens under the lock now).
+  - The daily quota-warning notification: `_quota_warned_date`'s check-and-set ran *outside* `quota_lock`, with the same failure mode — concurrent report threads breaching the threshold at once could each fire the "quota is getting low" notification. Fixed the same way.
+- **`_schedule_pending()` no longer relies on its caller already holding `lock`**: it previously assumed this implicitly (true only because its one call site happened to hold the lock already) rather than acquiring it itself, which would have been a silent reintroduction of the exact class of bug above the moment anyone called it from a new code path. `lock` is now an `RLock` (reentrant — needed since `process_alert()` calls `_schedule_pending()` from inside its own `with lock:` block) and `_schedule_pending()` acquires it explicitly.
+- **`--reconcile` now categorizes exactly like a live alert would have**: previously used a fixed `ABUSEIPDB_RECONCILE_SEVERITY`/`_CATEGORIES` for every reconciled report regardless of what CrowdSec actually detected. Now derives categories from the CrowdSec decision's own `scenario` field (now included in what `fetch_crowdsec_active_decisions()` returns) via a new `categories_for_scenario()` — a Python port of `abuseipdb.yaml`'s Go-template if/else-if chain — and severity via the existing `get_severity()`. `ABUSEIPDB_RECONCILE_SEVERITY`/`_CATEGORIES` remain as a fallback for decisions with no scenario name at all (e.g. added manually via `cscli decisions add`). `tests/test_scenario_mapping.py` parses `abuseipdb.yaml` itself and cross-checks it against the Python rule list, so the two can't silently drift apart.
+- `ci.yml`'s systemd-unit-syntax check was missing `abuseipdb-proxy-backup.service`/`.timer` and `abuseipdb-proxy-reconcile.service`/`.timer` (both added in v2.6.0) — CI wasn't actually validating either. Added.
+
+### Added
+- `tests/test_threading_server.py`: 4 real integration tests that start the actual `ThreadingHTTPServer` and fire concurrent HTTP requests at it — dedup correctness under real concurrency for both the same IP and many different IPs, the slow-whitelist-check-doesn't-block-others fix specifically, and a burst of malformed request bodies not taking the server down. `tests/test_scenario_mapping.py`: 23 tests for the new reconciliation categorization, including the yaml/Python consistency check. Plus 2 new regression tests for the race-condition fixes. 314 total.
+
 ## [2.7.0] - Secrets-from-file support, reconciliation notifications, README cleanup
 
 Purely additive — no breaking changes.
