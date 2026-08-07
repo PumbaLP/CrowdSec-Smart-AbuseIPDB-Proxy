@@ -32,6 +32,8 @@ jobs:
           systemd-analyze verify abuseipdb-proxy.service || true
           systemd-analyze verify abuseipdb-proxy-update-check.service abuseipdb-proxy-update-check.timer || true
           systemd-analyze verify abuseipdb-proxy-vacuum.service abuseipdb-proxy-vacuum.timer || true
+          systemd-analyze verify abuseipdb-proxy-backup.service abuseipdb-proxy-backup.timer || true
+          systemd-analyze verify abuseipdb-proxy-reconcile.service abuseipdb-proxy-reconcile.timer || true
 
   test:
     runs-on: ubuntu-latest
