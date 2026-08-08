@@ -5,6 +5,7 @@ deprecation warnings around it) — the JSON backend is deprecated as of
 """
 import json
 import sqlite3
+from contextlib import closing
 
 import pytest
 
@@ -29,9 +30,9 @@ def test_migrate_writes_all_sections_to_sqlite(json_proxy_with_data):
     assert result["entries"] == 2
     assert result["source"] == str(json_file)
 
-    conn = sqlite3.connect(result["target"])
-    assert list(conn.execute("SELECT ip, time, severity FROM reports")) == [("1.2.3.4", 1000, 2)]
-    assert list(conn.execute("SELECT ip FROM pending")) == [("5.6.7.8",)]
+    with closing(sqlite3.connect(result["target"])) as conn:
+        assert list(conn.execute("SELECT ip, time, severity FROM reports")) == [("1.2.3.4", 1000, 2)]
+        assert list(conn.execute("SELECT ip FROM pending")) == [("5.6.7.8",)]
 
 
 def test_migrate_default_target_replaces_json_extension_with_db(json_proxy_with_data):
@@ -92,8 +93,8 @@ def test_migrate_handles_legacy_v1_flat_json_format(make_proxy, tmp_path):
     result = p.run_migrate_to_sqlite()
 
     assert result["entries"] == 1
-    conn = sqlite3.connect(result["target"])
-    assert list(conn.execute("SELECT ip FROM reports")) == [("9.9.9.9",)]
+    with closing(sqlite3.connect(result["target"])) as conn:
+        assert list(conn.execute("SELECT ip FROM reports")) == [("9.9.9.9",)]
 
 
 def test_migrate_malformed_json_errors_cleanly(make_proxy, tmp_path):
