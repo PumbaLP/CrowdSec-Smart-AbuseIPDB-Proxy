@@ -243,3 +243,108 @@ def test_cli_doctor_exits_one_on_failure(tmp_path):
     del env["ABUSEIPDB_DRY_RUN"]
     result = run("--doctor", "--no-network", env=env)
     assert result.returncode == 1
+
+
+# --- Live self-test (run_live_self_test()) ----------------------------------
+
+def test_no_network_skips_the_live_self_test(proxy):
+    results = proxy.run_doctor(check_network=False)
+    assert any(level == "skip" and "Live self-test" in msg for level, msg in results)
+    assert not any("Live self-test:" in msg and level != "skip" for level, msg in results)
+
+
+def test_live_self_test_uses_the_documentation_test_ip(proxy, monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status = 200
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def read(self):
+            return b"OK"
+
+    def fake_urlopen(req, timeout=5):
+        captured["url"] = req.full_url
+        captured["body"] = proxy.json.loads(req.data.decode())
+        return FakeResponse()
+
+    monkeypatch.setattr(proxy.urllib.request, "urlopen", fake_urlopen)
+    result = proxy.run_live_self_test()
+
+    assert result["ok"] is True
+    assert captured["body"]["ip"] == "192.0.2.1"
+    # the whole point: this specific IP must always be filtered, so this
+    # self-test can never actually cause a real AbuseIPDB report
+    assert proxy.is_ignored_ip(captured["body"]["ip"]) is True
+
+
+def test_live_self_test_includes_shared_secret_header_when_configured(make_proxy, monkeypatch):
+    p = make_proxy(ABUSEIPDB_SHARED_SECRET="s3cret-value-thats-long-enough")
+    captured = {}
+
+    class FakeResponse:
+        status = 200
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def read(self):
+            return b"OK"
+
+    def fake_urlopen(req, timeout=5):
+        captured["secret_header"] = req.headers.get("X-proxy-secret")
+        return FakeResponse()
+
+    monkeypatch.setattr(p.urllib.request, "urlopen", fake_urlopen)
+    result = p.run_live_self_test()
+
+    assert result["ok"] is True
+    assert captured["secret_header"] == "s3cret-value-thats-long-enough"
+
+
+def test_live_self_test_connection_refused_warns_not_fails(proxy, monkeypatch):
+    def raise_it(req, timeout=5):
+        raise ConnectionRefusedError("connection refused")
+    monkeypatch.setattr(proxy.urllib.request, "urlopen", raise_it)
+
+    result = proxy.run_live_self_test()
+    assert result["ok"] is False
+    assert "could not reach" in result["detail"]
+
+    results = proxy.run_doctor(check_network=True)
+    assert any(level == "warn" and "Live self-test" in msg for level, msg in results)
+    assert not any(level == "fail" and "Live self-test" in msg for level, msg in results)
+
+
+def test_live_self_test_auth_rejection_is_reported_clearly(proxy, monkeypatch):
+    def raise_http_error(req, timeout=5):
+        raise proxy.urllib.error.HTTPError(req.full_url, 403, "Forbidden", {}, None)
+    monkeypatch.setattr(proxy.urllib.request, "urlopen", raise_http_error)
+
+    result = proxy.run_live_self_test()
+    assert result["ok"] is False
+    assert "403" in result["detail"]
+    assert "SHARED_SECRET" in result["detail"] or "ALLOWED_SOURCE_IPS" in result["detail"]
+
+
+def test_live_self_test_end_to_end_against_a_real_running_server(running_server):
+    """The real thing, no mocks: an actual ThreadingHTTPServer, and
+    run_live_self_test() run from a *different* freshly-made module
+    instance pointed at that server's port — same as invoking
+    `abuseipdb_proxy.py --doctor` as a separate process against an
+    already-running service would."""
+    p, base_url = running_server()
+    port = int(base_url.rsplit(":", 1)[1])
+
+    checker = p  # same module is fine here — run_live_self_test only reads its own LISTEN_PORT/etc.
+    checker.LISTEN_PORT = port
+    checker.LISTEN_ADDRESS = "127.0.0.1"
+
+    result = checker.run_live_self_test()
+
+    assert result["ok"] is True
+    assert "192.0.2.1" not in p.load_cache()["reports"]  # never actually reported
+    with p.metrics_lock:
+        assert p.metrics.get("reports_ignored_private_total", 0) == 1

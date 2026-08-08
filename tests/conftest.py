@@ -262,3 +262,31 @@ def deferred_thread(proxy, monkeypatch):
     DeferredThread.pending = []
     monkeypatch.setattr(proxy.threading, "Thread", DeferredThread)
     yield DeferredThread
+
+
+@pytest.fixture
+def running_server(make_proxy):
+    """Starts a real ThreadingHTTPServer for a freshly-made proxy module
+    on an OS-assigned free port, and tears it down after the test. Yields
+    a factory: call it (optionally with env var overrides, same as
+    make_proxy) to get (proxy_module, base_url). Shared across any test
+    file that needs to exercise real concurrent HTTP behavior rather than
+    calling functions directly in a single test thread."""
+    import threading as _threading
+
+    def _start(**env_overrides):
+        p = make_proxy(**env_overrides)
+        server = p.http.server.ThreadingHTTPServer(("127.0.0.1", 0), p.AbuseIPDBHandler)
+        server.daemon_threads = True
+        server.request_queue_size = 128  # match main()'s production setting
+        thread = _threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = server.server_address[1]
+        _start.servers.append(server)
+        return p, f"http://127.0.0.1:{port}"
+
+    _start.servers = []
+    yield _start
+    for server in _start.servers:
+        server.shutdown()
+        server.server_close()
