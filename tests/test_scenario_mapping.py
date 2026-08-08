@@ -50,9 +50,7 @@ def test_yaml_template_is_parseable_at_all():
     assert default == "15"
 
 
-def test_python_rules_match_yaml_template_exactly():
-    import abuseipdb_proxy as proxy
-
+def test_python_rules_match_yaml_template_exactly(proxy):
     yaml_rules, yaml_default = _parse_yaml_template_rules()
 
     assert proxy.SCENARIO_CATEGORY_RULES == yaml_rules, (
@@ -85,17 +83,14 @@ def test_python_rules_match_yaml_template_exactly():
     ("some-unknown-exploit-attempt", "15,21"),
     ("totally-unrecognized-scenario", "15"),          # default
 ])
-def test_categories_for_scenario_matches_expected(scenario, expected):
-    import abuseipdb_proxy as proxy
+def test_categories_for_scenario_matches_expected(proxy, scenario, expected):
     assert proxy.categories_for_scenario(scenario) == expected
 
 
-def test_categories_for_scenario_is_case_insensitive():
-    import abuseipdb_proxy as proxy
+def test_categories_for_scenario_is_case_insensitive(proxy):
     assert proxy.categories_for_scenario("CrowdSecurity/SSH-BF") == "18,22"
 
 
-def test_categories_for_scenario_none_for_empty_input():
-    import abuseipdb_proxy as proxy
+def test_categories_for_scenario_none_for_empty_input(proxy):
     assert proxy.categories_for_scenario("") is None
     assert proxy.categories_for_scenario(None) is None
