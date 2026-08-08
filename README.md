@@ -211,10 +211,11 @@ Any secret-like variable below (API key, tokens, webhook URLs, the shared secret
 | `ABUSEIPDB_MAX_RETRIES` | `3` | How many times to retry a failed report before giving up |
 | `ABUSEIPDB_RETRY_DELAY` | `900` | Seconds to wait before retrying a failed report (overridden by the API's `Retry-After` header when present, e.g. on a 429) |
 | `ABUSEIPDB_DRY_RUN` | `false` | If `true`, log what would be reported instead of calling the AbuseIPDB API. Can also be set per-run with `--dry-run`. |
-| `ABUSEIPDB_IGNORE_PRIVATE` | `true` | If `true`, silently skip RFC1918/loopback/link-local/CGNAT addresses (never worth reporting). Covers Tailscale's 100.64.0.0/10 range too. |
+| `ABUSEIPDB_IGNORE_PRIVATE` | `true` | If `true`, silently skip RFC1918/loopback/link-local/CGNAT addresses (never worth reporting) as well as the RFC 5737/RFC 3849 documentation-only ranges (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24, 2001:db8::/32 — never assigned to a real host, so never a genuine attacker). Covers Tailscale's 100.64.0.0/10 range too. |
 | `ABUSEIPDB_IGNORE_IPS` | *(empty)* | Extra comma-separated IPs/CIDRs to always skip, on top of the built-in private ranges |
 | `ABUSEIPDB_ALLOWED_SOURCE_IPS` | *(empty)* | Comma-separated IPs/CIDRs allowed to POST to the proxy. Empty means no allowlist is enforced (matches current behavior). An extra layer on top of `ABUSEIPDB_LISTEN_ADDRESS`, mainly useful when the listener isn't loopback-only. |
 | `ABUSEIPDB_SHARED_SECRET` | *(empty)* | If set, incoming POSTs must include a matching `X-Proxy-Secret` header (see the commented-out example in `abuseipdb.yaml`). Empty means no secret is required (matches current behavior). |
+| `ABUSEIPDB_MAX_CONCURRENT_REQUESTS` | `50` | Safety net, not a normal throttle: caps how many requests the proxy handles at once (each gets its own thread). `0` disables the limit. Rejects with an immediate `503` rather than queuing — meant for a genuine misconfiguration/bug, not to smooth over ordinary bursts. |
 | `ABUSEIPDB_QUOTA_RESERVE_MEDIUM` | `0` | Reserve this many of the day's remaining AbuseIPDB reports for severity 2 and up, holding back severity-1 reports once remaining quota drops to or below it. `0` disables reservation. Only takes effect once the proxy has seen a remaining-quota count from AbuseIPDB. |
 | `ABUSEIPDB_QUOTA_RESERVE_HIGH` | `0` | Same, but for severity 3 only — holds back severity 1 and 2 once remaining quota drops to or below it. Should normally be `<=` `ABUSEIPDB_QUOTA_RESERVE_MEDIUM`. `0` disables reservation. |
 | `ABUSEIPDB_SKIP_WHITELISTED` | `false` | If `true`, skip reporting IPs that AbuseIPDB's own `/v2/check` marks as whitelisted (e.g. well-known crawlers/CDNs that opted in). Uses its own separate daily quota from `/v2/report`, and makes a synchronous network call on the request path for a cache miss — see `ABUSEIPDB_WHITELIST_CACHE_TTL`. |
@@ -286,10 +287,11 @@ Beyond just running the proxy itself, `abuseipdb_proxy.py` (or `abuseipdb_proxy.
 | `--vacuum` | Prune stale reports and reclaim disk space on the SQLite backend. No-op on JSON. |
 | `--backup [DIR]` | Write a timestamped cache snapshot into DIR (default: `backups/` next to the cache file), then prune old backups beyond `ABUSEIPDB_BACKUP_RETENTION` (default 14). Suitable for a periodic timer. |
 | `--check-config [--json]` | Validate the configuration (API key, cache path, alerting backends, timing) with no network access and no changes made. Exit code 1 if anything failed. |
-| `--doctor [--no-network] [--json]` | Everything `--check-config` covers, plus systemd service status, file permissions, CrowdSec `profiles.yaml` wiring, cache readability, and (unless `--no-network`) whether api.abuseipdb.com is reachable. Bare-metal-specific checks skip cleanly outside that context (e.g. in Docker). |
+| `--doctor [--no-network] [--json]` | Everything `--check-config` covers, plus systemd service status, file permissions, CrowdSec `profiles.yaml` wiring, cache readability, whether api.abuseipdb.com is reachable, and (unless `--no-network`) a live self-test — sends a synthetic, always-filtered test alert through the actually running proxy's real HTTP endpoint, confirming the deployed instance is truly listening and working, not just that this CLI invocation's config looks right. Bare-metal-specific checks skip cleanly outside that context (e.g. in Docker). |
 | `--test-notify` | Send a test message to every configured alerting backend. |
 | `--notify MESSAGE [--notify-priority low\|normal\|high]` | Send an arbitrary message through the configured alerting backend(s). Used internally by `update.sh --check-only`. |
 | `--reconcile [--json]` | Compare CrowdSec's currently active decisions against this proxy's report cache and report any that are missing (see "CrowdSec decision reconciliation" below). Suitable for a periodic timer. |
+| `--migrate-to-sqlite [PATH]` | One-time migration off the deprecated `ABUSEIPDB_CACHE_BACKEND=json` (removed in 3.0.0): writes the current JSON cache into a new SQLite database at PATH (default: same name with a `.db` extension), without touching or deleting the JSON file or changing your configuration. Refuses to overwrite an existing target file. Update `ABUSEIPDB_CACHE_BACKEND=sqlite` yourself afterward. |
 
 ## Endpoints
 
@@ -391,7 +393,7 @@ crowdsec-smart-abuseipdb/
 
 - No authentication on the local port by default — not a concern as long as it only listens on `127.0.0.1` (the Docker default of `0.0.0.0` is fine specifically because it stays inside Docker's own network isolation, see "Docker" above). For setups where that boundary is less clean-cut, `ABUSEIPDB_ALLOWED_SOURCE_IPS` and `ABUSEIPDB_SHARED_SECRET` add optional extra layers — see "Configuration" above.
 - The 15-minute default window is configurable per severity tier (`ABUSEIPDB_REPORT_WINDOW_*`) and, since v2.5.0, per category (`ABUSEIPDB_REPORT_WINDOW_CATEGORIES`) — but still not per individual IP.
-- The default SQLite cache scales comfortably to a large report history; the JSON backend (`ABUSEIPDB_CACHE_BACKEND=json`) is fine for typical CrowdSec traffic volumes but, being a flat file rewritten on every save, isn't built for extremely high cardinality (tens of thousands of distinct IPs tracked at once).
+- The default SQLite cache scales comfortably to a large report history; the JSON backend (`ABUSEIPDB_CACHE_BACKEND=json`) is **deprecated as of v2.9.0 and will be removed entirely in 3.0.0**. If you're still on it, run `abuseipdb_proxy.py --migrate-to-sqlite` and switch over — see "Configuration" above.
 
 ## Contributing
 

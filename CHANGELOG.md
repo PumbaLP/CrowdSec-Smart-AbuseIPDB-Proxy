@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented here.
 
+## [2.9.0] - JSON backend deprecation + migration path, concurrent-request ceiling, IPv6 audit, live self-test
+
+Purely additive/fixes — no breaking changes yet (3.0.0 will remove the JSON backend entirely).
+
+### Deprecated
+- **`ABUSEIPDB_CACHE_BACKEND=json`** — will be removed entirely in 3.0.0. Logs a warning on startup and in `--check-config`. Migration path: new **`--migrate-to-sqlite [PATH]`** CLI flag writes the current JSON cache into a new SQLite database (default target: same filename with a `.db` extension) without touching or deleting the JSON file, and refuses to overwrite an existing target. Understands both the current cache format and the flat v1.0.0 one. `tests/test_migrate_to_sqlite.py`: 11 tests.
+
+### Added
+- **`ABUSEIPDB_MAX_CONCURRENT_REQUESTS`** (default `50`, `0` disables): a safety net, not a normal throttle, against an unbounded number of request-handling threads under `ThreadingHTTPServer` (v2.8.0) — a misconfiguration or bug feeding the proxy a flood of decisions could otherwise spin up threads without limit. A non-blocking semaphore around the whole request handler; over the limit gets an immediate `503` + `Retry-After: 1` rather than queuing. New `abuseipdb_proxy_reports_rejected_overload_total` metric.
+- **RFC 5737 / RFC 3849 documentation ranges** (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24, 2001:db8::/32) added to the default ignore list alongside the existing private/reserved ranges — these are reserved exclusively for documentation and examples, never assigned to a real host, so never a genuine attacker. Controlled by the same `ABUSEIPDB_IGNORE_PRIVATE` toggle. This also underpins the new live self-test below: 192.0.2.1 is guaranteed to always be filtered, so that self-test can never actually reach the real AbuseIPDB API.
+- **`--doctor` live self-test**: beyond `--doctor`'s existing static checks (which only validate the current CLI invocation's own environment), it now sends one synthetic test alert through the *actually running* proxy's real HTTP endpoint on localhost — confirming the deployed instance is truly listening and processing requests correctly, not just that the configuration looks right on paper. Skipped by `--no-network`, same as the existing api.abuseipdb.com reachability check.
+- **IPv6 audit**: dedicated test coverage (`tests/test_ipv6.py`, 10 tests) for the source-IP allowlist, custom ignore-list entries, CrowdSec decision reconciliation, and a full end-to-end round-trip through the real running server — all with IPv6 addresses specifically. No bugs found (the existing `ipaddress`-module-based code already handled IPv6 correctly throughout), but it wasn't previously exercised this thoroughly.
+- `tests/test_threading_server.py`: 2 new tests for the concurrent-request ceiling (rejects over the limit with 503; `0` disables it) — 6 total in that file now. `tests/test_doctor.py`: 6 new tests for the live self-test, including a full end-to-end run against a real server — 26 total in that file now.
+- A shared `running_server` fixture (starts a real `ThreadingHTTPServer` on an OS-assigned port) moved from `test_threading_server.py` into `conftest.py` so `test_ipv6.py` and `test_doctor.py` could reuse it too, instead of duplicating it.
+
+### Fixed
+- `tests/test_ip_filtering.py` used `203.0.113.5` (TEST-NET-3) as an example of a "public, never ignored" IP — now correctly moved to the "always ignored" test cases, since it's a documentation range as of this release. A couple of other tests using TEST-NET-3 addresses as arbitrary stand-ins for "some public IP" were updated to non-reserved addresses so they keep testing what they were meant to.
+
 ## [2.8.0] - Concurrent request handling, precise reconciliation categorization
 
 Purely additive/fixes — no breaking changes.

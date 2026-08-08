@@ -28,7 +28,7 @@ import sys
 import threading
 from datetime import datetime, timezone
 
-VERSION = "2.8.0"
+VERSION = "2.9.0"
 
 START_TIME = time.time()
 
@@ -299,6 +299,15 @@ _DEFAULT_IGNORE_NETWORKS = [
     "::1/128",            # IPv6 loopback
     "fc00::/7",           # IPv6 unique local
     "fe80::/10",          # IPv6 link-local
+    # RFC 5737 / RFC 3849: reserved exclusively for documentation and
+    # examples, never assigned to a real host — can't ever be a genuine
+    # attacker. Also what --check-config --live's synthetic self-test
+    # alert uses (192.0.2.1), which relies on it always landing here
+    # rather than ever reaching the real AbuseIPDB API.
+    "192.0.2.0/24",       # TEST-NET-1
+    "198.51.100.0/24",    # TEST-NET-2
+    "203.0.113.0/24",     # TEST-NET-3
+    "2001:db8::/32",      # IPv6 documentation range
 ]
 
 
@@ -381,6 +390,20 @@ def is_shared_secret_valid(provided):
     if not SHARED_SECRET:
         return True
     return hmac.compare_digest(provided or "", SHARED_SECRET)
+
+
+# --- Concurrent-request ceiling ---------------------------------------------
+# Since v2.8.0's switch to ThreadingHTTPServer, every connection gets its
+# own thread with no upper bound. CrowdSec itself is trusted, so this
+# isn't really about defending against abuse — it's a safety net against
+# a misconfiguration or bug (a scenario loop, a flood of decisions) piling
+# up an unbounded number of threads. 0 disables the limit entirely.
+# Rejection is immediate (non-blocking), not a queued wait — this is meant
+# to fail fast and loud under a genuinely abnormal load, not to smooth
+# over ordinary bursts (the default of 50 is well above what any real
+# CrowdSec setup should ever produce at once).
+MAX_CONCURRENT_REQUESTS = int(os.getenv("ABUSEIPDB_MAX_CONCURRENT_REQUESTS", "50"))
+_request_semaphore = threading.Semaphore(MAX_CONCURRENT_REQUESTS) if MAX_CONCURRENT_REQUESTS > 0 else None
 
 
 # --- Alerting (Gotify / ntfy / Slack / Discord / Matrix / Telegram / -------
@@ -585,6 +608,7 @@ metrics = {
     "reports_ignored_private_total": 0,
     "reports_quota_reserved_total": 0,
     "reports_whitelisted_total": 0,
+    "reports_rejected_overload_total": 0,
 }
 
 
@@ -807,9 +831,9 @@ CREATE TABLE IF NOT EXISTS retry_queue (
 """
 
 
-def _sqlite_connect():
+def _sqlite_connect(path=None):
     ensure_cache_dir()
-    conn = sqlite3.connect(CACHE_FILE, timeout=10)
+    conn = sqlite3.connect(path or CACHE_FILE, timeout=10)
     # Values validated at import time (see _validated_pragma above), so
     # this f-string is safe despite PRAGMA not supporting parameter
     # binding in the sqlite3 module.
@@ -909,8 +933,8 @@ def _load_cache_sqlite():
         conn.close()
 
 
-def _save_cache_sqlite(cache):
-    conn = _sqlite_connect()
+def _save_cache_sqlite(cache, path=None):
+    conn = _sqlite_connect(path)
     try:
         with conn:  # single transaction: either the whole cache is
                     # replaced, or (on error) none of it is — same
@@ -1472,6 +1496,21 @@ class AbuseIPDBHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        if _request_semaphore is not None and not _request_semaphore.acquire(blocking=False):
+            log(f"Rejected POST from {client_ip}: at ABUSEIPDB_MAX_CONCURRENT_REQUESTS "
+                f"limit ({MAX_CONCURRENT_REQUESTS}).", level="warning", source_ip=client_ip)
+            inc_metric("reports_rejected_overload_total")
+            self.send_response(503)
+            self.send_header("Retry-After", "1")
+            self.end_headers()
+            return
+        try:
+            self._handle_post()
+        finally:
+            if _request_semaphore is not None:
+                _request_semaphore.release()
+
+    def _handle_post(self):
         content_length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(content_length)
 
@@ -1570,6 +1609,9 @@ class AbuseIPDBHandler(http.server.BaseHTTPRequestHandler):
         counter("abuseipdb_proxy_reports_whitelisted_total",
                  "Total alerts skipped because AbuseIPDB itself marks the IP as whitelisted.",
                  snapshot.get("reports_whitelisted_total", 0))
+        counter("abuseipdb_proxy_reports_rejected_overload_total",
+                 "Total POSTs rejected with 503 because ABUSEIPDB_MAX_CONCURRENT_REQUESTS was reached.",
+                 snapshot.get("reports_rejected_overload_total", 0))
         gauge("abuseipdb_proxy_pending_escalations", "Current number of delayed escalation reports awaiting delivery.",
               len(pending_timers))
         gauge("abuseipdb_proxy_pending_retries", "Current number of reports queued for retry.",
@@ -1908,6 +1950,10 @@ def check_config():
     # --- Cache ---
     if CACHE_BACKEND not in ("json", "sqlite"):
         fail(f"ABUSEIPDB_CACHE_BACKEND={CACHE_BACKEND!r} is invalid (must be 'json' or 'sqlite')")
+    elif CACHE_BACKEND == "json":
+        warn(f"Cache backend: json ({CACHE_FILE}) — deprecated, will be removed in 3.0.0. "
+             f"Run 'abuseipdb_proxy.py --migrate-to-sqlite' to switch, then set "
+             f"ABUSEIPDB_CACHE_BACKEND=sqlite.")
     else:
         ok(f"Cache backend: {CACHE_BACKEND} ({CACHE_FILE})")
     try:
@@ -1941,6 +1987,14 @@ def check_config():
         ok(f"Source-IP allowlist active: {len(ALLOWED_SOURCE_NETWORKS)} network(s)")
     if SHARED_SECRET and len(SHARED_SECRET) < 16:
         warn("ABUSEIPDB_SHARED_SECRET is set but shorter than 16 characters — consider a longer value")
+    if MAX_CONCURRENT_REQUESTS < 0:
+        fail(f"ABUSEIPDB_MAX_CONCURRENT_REQUESTS={MAX_CONCURRENT_REQUESTS} is invalid (must be >= 0; 0 disables the limit)")
+    elif MAX_CONCURRENT_REQUESTS == 0:
+        warn("ABUSEIPDB_MAX_CONCURRENT_REQUESTS=0 — no ceiling on concurrent in-flight requests; "
+             "a misconfiguration or bug feeding it a flood of decisions could spin up an unbounded "
+             "number of threads")
+    else:
+        ok(f"Concurrent request ceiling: {MAX_CONCURRENT_REQUESTS}")
 
     # --- Quota reservation ---
     if QUOTA_RESERVE_HIGH and QUOTA_RESERVE_MEDIUM and QUOTA_RESERVE_MEDIUM < QUOTA_RESERVE_HIGH:
@@ -2166,7 +2220,73 @@ def run_doctor(check_network=True):
     else:
         skip("Network reachability check skipped (--no-network)")
 
+    # --- live self-test against the actually-running proxy ---
+    # Everything above checks that *this* process's config/environment
+    # looks right. It says nothing about whether the deployed, currently
+    # running instance (started by systemd, possibly minutes or months
+    # ago) is actually working — a stale process from before a config
+    # change, a silently-dead listener, etc. wouldn't show up above at
+    # all. This sends one synthetic alert through the proxy's real HTTP
+    # endpoint on localhost and confirms it comes back with a 200.
+    if check_network:
+        live_result = run_live_self_test()
+        if live_result["ok"]:
+            ok(f"Live self-test: {live_result['detail']}")
+        else:
+            warn(f"Live self-test: {live_result['detail']}")
+    else:
+        skip("Live self-test skipped (--no-network)")
+
     return results
+
+
+def run_live_self_test():
+    """
+    Sends one synthetic, guaranteed-harmless alert (192.0.2.1, an RFC 5737
+    documentation-only IP that is always in the default ignore list — see
+    IGNORE_NETWORKS — so this can never actually reach the real AbuseIPDB
+    API, regardless of ABUSEIPDB_DRY_RUN) through the proxy's real HTTP
+    endpoint on localhost, exercising the full path a live CrowdSec alert
+    would take: TCP connect, the source-IP/shared-secret auth checks,
+    JSON parsing, and IP filtering. A response confirms the *currently
+    running* instance is actually listening and processing correctly —
+    something --check-config's static checks can't tell you, since they
+    only validate this process's own environment, not whether a
+    long-running deployed instance is still healthy.
+
+    Returns {"ok": bool, "detail": str}. Never raises.
+    """
+    host = "127.0.0.1" if LISTEN_ADDRESS in ("0.0.0.0", "::") else LISTEN_ADDRESS
+    url = f"http://{host}:{LISTEN_PORT}/"
+    headers = {"Content-Type": "application/json"}
+    if SHARED_SECRET:
+        headers["X-Proxy-Secret"] = SHARED_SECRET
+    payload = json.dumps({
+        "ip": "192.0.2.1",
+        "categories": "15",
+        "comment": "abuseipdb-proxy self-test (--doctor) — always filtered, never reported",
+    }).encode("utf-8")
+
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        return {
+            "ok": False,
+            "detail": f"proxy at {url} responded with HTTP {e.code} — check "
+                      f"ABUSEIPDB_SHARED_SECRET/ABUSEIPDB_ALLOWED_SOURCE_IPS if either is set",
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "detail": f"could not reach the proxy at {url}: {e}. Is the service actually running? "
+                      f"(This checks the currently listening process, not this CLI invocation.)",
+        }
+
+    if status != 200:
+        return {"ok": False, "detail": f"unexpected HTTP {status} from {url}"}
+    return {"ok": True, "detail": f"{url} accepted and processed a synthetic test alert correctly"}
 
 
 def format_doctor_output(results):
@@ -2185,6 +2305,62 @@ def format_doctor_output(results):
 
 
 BACKUP_RETENTION = int(os.getenv("ABUSEIPDB_BACKUP_RETENTION", "14"))
+
+
+def run_migrate_to_sqlite(target_path=None):
+    """
+    One-shot migration for ABUSEIPDB_CACHE_BACKEND=json users (deprecated,
+    removed entirely in 3.0.0): reads the currently-configured JSON cache
+    and writes it into a SQLite database, without touching the live
+    ABUSEIPDB_CACHE_BACKEND setting — that's a config change the person
+    makes themselves afterward, once they've confirmed the migration
+    looks right. Safe to re-run: it only ever reads the JSON file, never
+    modifies or deletes it.
+    """
+    if CACHE_BACKEND != "json":
+        return {
+            "error": f"ABUSEIPDB_CACHE_BACKEND is already {CACHE_BACKEND!r} — nothing to migrate. "
+                     f"This only migrates *from* the json backend."
+        }
+
+    if not os.path.exists(CACHE_FILE):
+        return {"error": f"No JSON cache found at {CACHE_FILE} — nothing to migrate."}
+
+    try:
+        with open(CACHE_FILE, "r") as f:
+            data = json.load(f)
+    except Exception as e:
+        return {"error": f"Could not read {CACHE_FILE}: {e}"}
+
+    if "reports" in data or "pending" in data or "retry_queue" in data:
+        data.setdefault("reports", {})
+        data.setdefault("pending", {})
+        data.setdefault("retry_queue", {})
+    else:
+        data = {"reports": data, "pending": {}, "retry_queue": {}}  # v1.0.0 flat format
+
+    if not target_path:
+        base, _ = os.path.splitext(CACHE_FILE)
+        target_path = base + ".db"
+
+    if os.path.exists(target_path):
+        return {
+            "error": f"{target_path} already exists — refusing to overwrite it. "
+                     f"Pass an explicit --migrate-to-sqlite=PATH to choose a different target, "
+                     f"or remove the existing file first if you're sure it's safe to replace."
+        }
+
+    try:
+        _save_cache_sqlite(data, path=target_path)
+    except Exception as e:
+        return {"error": f"Migration failed: {e}"}
+
+    entry_count = sum(len(section) for section in data.values())
+    return {
+        "source": CACHE_FILE,
+        "target": target_path,
+        "entries": entry_count,
+    }
 
 
 def run_backup(backup_dir=None):
@@ -2422,14 +2598,17 @@ def parse_args():
         action="store_true",
         help="Everything --check-config covers, plus systemd service status, file permissions, "
              "whether CrowdSec's profiles.yaml actually wires this notification up, cache "
-             "readability, and (unless --no-network) whether api.abuseipdb.com is reachable. "
-             "Bare-metal-specific checks skip themselves cleanly when they don't apply (e.g. in "
-             "Docker). Exit code is 1 if anything failed, 0 otherwise.",
+             "readability, whether api.abuseipdb.com is reachable, and (unless --no-network) a "
+             "live self-test — a synthetic, always-filtered test alert sent through the actually "
+             "running proxy's real HTTP endpoint, confirming the deployed instance is truly "
+             "listening and working end-to-end, not just that this CLI invocation's config looks "
+             "right. Bare-metal-specific checks skip themselves cleanly when they don't apply "
+             "(e.g. in Docker). Exit code is 1 if anything failed, 0 otherwise.",
     )
     parser.add_argument(
         "--no-network",
         action="store_true",
-        help="With --doctor, skip the api.abuseipdb.com reachability check.",
+        help="With --doctor, skip the api.abuseipdb.com reachability check and the live self-test.",
     )
     parser.add_argument(
         "--backup",
@@ -2464,6 +2643,16 @@ def parse_args():
              "proxy's report cache, and report any that are missing — catches reports lost to "
              "proxy downtime. Requires ABUSEIPDB_CROWDSEC_BOUNCER_KEY. Suitable for a periodic "
              "timer, e.g. hourly.",
+    )
+    parser.add_argument(
+        "--migrate-to-sqlite",
+        metavar="PATH", nargs="?", const=None, default="__unset__",
+        help="One-time migration for ABUSEIPDB_CACHE_BACKEND=json setups (deprecated, removed "
+             "in 3.0.0): writes the current JSON cache into a new SQLite database at PATH "
+             "(default: same name as the JSON file with a .db extension) without deleting the "
+             "JSON file or changing your configuration. Refuses to overwrite an existing target "
+             "file. Update ABUSEIPDB_CACHE_BACKEND=sqlite (and ABUSEIPDB_CACHE_FILE if needed) "
+             "afterward.",
     )
     return parser.parse_args()
 
@@ -2549,6 +2738,22 @@ if __name__ == "__main__":
             print(json.dumps(result, indent=2))
         sys.exit(0)
 
+    if args.migrate_to_sqlite != "__unset__":
+        result = run_migrate_to_sqlite(target_path=args.migrate_to_sqlite)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        elif "error" in result:
+            print(f"Migration failed: {result['error']}")
+        else:
+            print(
+                f"Migrated {result['entries']} entries from {result['source']} "
+                f"to {result['target']}.\n\n"
+                f"Next: set ABUSEIPDB_CACHE_BACKEND=sqlite and "
+                f"ABUSEIPDB_CACHE_FILE={result['target']} in your env file, then restart. "
+                f"The JSON file was not modified or deleted."
+            )
+        sys.exit(1 if "error" in result else 0)
+
     if args.reconcile:
         if args.dry_run:
             DRY_RUN = True
@@ -2608,6 +2813,14 @@ if __name__ == "__main__":
 
     if DRY_RUN:
         log("Dry-run mode enabled: no reports will be sent to AbuseIPDB.")
+
+    if CACHE_BACKEND == "json":
+        log(
+            "ABUSEIPDB_CACHE_BACKEND=json is deprecated and will be removed in 3.0.0. "
+            "Run 'abuseipdb_proxy.py --migrate-to-sqlite' to switch over, then set "
+            "ABUSEIPDB_CACHE_BACKEND=sqlite.",
+            level="warning",
+        )
 
     ensure_cache_dir()
     resume_state_from_cache()
