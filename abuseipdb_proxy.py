@@ -834,12 +834,25 @@ CREATE TABLE IF NOT EXISTS retry_queue (
 def _sqlite_connect(path=None):
     ensure_cache_dir()
     conn = sqlite3.connect(path or CACHE_FILE, timeout=10)
-    # Values validated at import time (see _validated_pragma above), so
-    # this f-string is safe despite PRAGMA not supporting parameter
-    # binding in the sqlite3 module.
-    conn.execute(f"PRAGMA journal_mode={CACHE_SQLITE_JOURNAL_MODE}")
-    conn.execute(f"PRAGMA synchronous={CACHE_SQLITE_SYNCHRONOUS}")
-    conn.executescript(_SQLITE_SCHEMA)
+    try:
+        # Values validated at import time (see _validated_pragma above), so
+        # this f-string is safe despite PRAGMA not supporting parameter
+        # binding in the sqlite3 module.
+        conn.execute(f"PRAGMA journal_mode={CACHE_SQLITE_JOURNAL_MODE}")
+        conn.execute(f"PRAGMA synchronous={CACHE_SQLITE_SYNCHRONOUS}")
+        conn.executescript(_SQLITE_SCHEMA)
+    except Exception:
+        # sqlite3.connect() succeeds even for a path that can't actually
+        # be opened — SQLite defers the real file open until the first
+        # statement touches it (exactly what happens here, one line
+        # later). If that first touch fails, `conn` was never handed back
+        # to a caller's try/finally, so nothing would ever close it
+        # without this — a real ResourceWarning: unclosed database,
+        # not just a theoretical one (this is what
+        # test_write_failure_triggers_one_high_priority_notification
+        # exercises).
+        conn.close()
+        raise
     return conn
 
 
