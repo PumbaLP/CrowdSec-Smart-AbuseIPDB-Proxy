@@ -2,7 +2,7 @@
 # (stdlib only: http.server, sqlite3, urllib, ipaddress, argparse, ...),
 # so this image needs nothing beyond the interpreter itself. Alpine is
 # used specifically to keep it small and resource-light — the official
-# python:3.12-alpine image builds CPython from source with sqlite-dev
+# python:3.13-alpine image builds CPython from source with sqlite-dev
 # present, so `import sqlite3` works out of the box (verified by the
 # "docker" CI job in .github/workflows/ci.yml on every push, since this
 # specific point has bitten people with *other*, non-official Alpine

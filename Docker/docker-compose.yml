@@ -29,10 +29,9 @@ services:
       #   source: ./secrets/abuseipdb_api_key.txt
       #   target: /run/secrets/abuseipdb_api_key
       #   read_only: true
-    # This is a single-threaded stdlib-only Python process handling
-    # occasional CrowdSec alerts — 64MB RAM / 0.25 CPU is already
-    # generous headroom, not a tight fit. Uncomment if you want a hard
-    # ceiling (e.g. on a resource-constrained host):
+    # A stdlib-only Python process handling occasional CrowdSec alerts —
+    # 64MB RAM / 0.25 CPU is already generous headroom, not a tight fit.
+    # Uncomment if you want a hard ceiling (e.g. on a resource-constrained host):
     # mem_limit: 64m
     # cpus: 0.25
     # Not published to the host by default — CrowdSec should reach this
