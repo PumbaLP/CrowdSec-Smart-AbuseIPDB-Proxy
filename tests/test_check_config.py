@@ -42,10 +42,15 @@ def test_short_api_key_warns(make_proxy, monkeypatch):
     assert any(level == "warn" and "API_KEY" in msg for level, msg in results)
 
 
-def test_invalid_cache_backend_fails(proxy, monkeypatch):
-    monkeypatch.setattr(proxy, "CACHE_BACKEND", "bogus")
-    results = proxy.check_config()
-    assert any(level == "fail" and "CACHE_BACKEND" in msg for level, msg in results)
+def test_cache_backend_no_longer_json_warns_but_still_runs(make_proxy, tmp_path):
+    # ABUSEIPDB_CACHE_BACKEND was removed in 3.0.0 (sqlite is the only
+    # option now) — an old env file still setting it to "json" (or
+    # anything else) must not be fatal, just loudly warned about.
+    p = make_proxy(ABUSEIPDB_CACHE_BACKEND="json", ABUSEIPDB_CACHE_FILE=str(tmp_path / "cache.db"))
+    results = p.check_config()
+    assert any(level == "warn" and "no longer supported" in msg for level, msg in results)
+    assert not any(level == "fail" and "CACHE_BACKEND" in msg for level, msg in results)
+    assert p.CACHE_BACKEND == "sqlite"
 
 
 def test_unwritable_cache_dir_fails(proxy, monkeypatch, tmp_path):
@@ -125,12 +130,10 @@ def test_valid_webhook_url_is_ok(make_proxy):
     assert any(level == "ok" and "webhook" in msg for level, msg in results)
 
 
-def test_sqlite_pragma_summary_only_shown_for_sqlite_backend(make_proxy, tmp_path):
-    sqlite_p = make_proxy(ABUSEIPDB_CACHE_BACKEND="sqlite", ABUSEIPDB_CACHE_FILE=str(tmp_path / "c.db"))
-    assert any("SQLite pragmas:" in msg for _, msg in sqlite_p.check_config())
-
-    json_p = make_proxy(ABUSEIPDB_CACHE_BACKEND="json", ABUSEIPDB_CACHE_FILE=str(tmp_path / "c.json"))
-    assert not any("SQLite pragmas:" in msg for _, msg in json_p.check_config())
+def test_sqlite_pragma_summary_always_shown(proxy):
+    # SQLite is the only cache backend since 3.0.0 — no more conditional
+    # display depending on which backend happened to be active.
+    assert any("SQLite pragmas:" in msg for _, msg in proxy.check_config())
 
 
 # --- format_config_check() ---------------------------------------------------

@@ -24,33 +24,6 @@ def test_corrupt_json_falls_back_to_empty_structure(proxy):
     assert cache == {"reports": {}, "pending": {}, "retry_queue": {}}
 
 
-def test_v1_0_0_legacy_flat_format_is_upgraded(proxy):
-    # v1.0.0 wrote a bare {ip: {"time", "severity"}} map as the whole file.
-    legacy = {"1.2.3.4": {"time": 1000, "severity": 2}}
-    with open(proxy.CACHE_FILE, "w") as f:
-        json.dump(legacy, f)
-
-    cache = proxy.load_cache()
-    assert cache["reports"] == legacy
-    assert cache["pending"] == {}
-    assert cache["retry_queue"] == {}
-
-
-def test_v1_1_0_format_without_retry_queue_is_upgraded(proxy):
-    # v1.1.0 added "pending" but not yet "retry_queue" (that came in v1.2.0).
-    old = {
-        "reports": {"1.2.3.4": {"time": 1000, "severity": 2}},
-        "pending": {"5.6.7.8": {"due_time": 2000, "severity": 3,
-                                 "categories": "15", "comment": "x"}},
-    }
-    with open(proxy.CACHE_FILE, "w") as f:
-        json.dump(old, f)
-
-    cache = proxy.load_cache()
-    assert cache["reports"] == old["reports"]
-    assert cache["pending"] == old["pending"]
-    assert cache["retry_queue"] == {}
-
 
 def test_save_cache_is_atomic_no_tmp_file_left_behind(proxy):
     proxy.save_cache({"reports": {}, "pending": {}, "retry_queue": {}})

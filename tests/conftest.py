@@ -111,12 +111,8 @@ def _load_fresh_module():
 def make_proxy(monkeypatch, tmp_path):
     """Factory fixture: make_proxy(**env) returns a freshly-imported proxy
     module configured with the given environment variables (plus sane
-    defaults: a dummy API key, an isolated per-test cache file, and the
-    JSON cache backend pinned explicitly — the module itself defaults to
-    SQLite since v2.0.0, but most tests don't care which backend is
-    active and JSON is simpler to inspect/corrupt directly in a test).
-    Pass ABUSEIPDB_CACHE_BACKEND="sqlite" to override for backend-specific
-    tests — see test_cache_sqlite.py."""
+    defaults: a dummy API key, an isolated per-test cache file on the
+    SQLite backend — the only one since 3.0.0 — and dry-run mode)."""
 
     def _make(**env_overrides):
         for var in _ENV_VARS_UNDER_TEST:
@@ -124,8 +120,7 @@ def make_proxy(monkeypatch, tmp_path):
 
         env = {
             "ABUSEIPDB_API_KEY": "test-key",
-            "ABUSEIPDB_CACHE_FILE": str(tmp_path / "cache.json"),
-            "ABUSEIPDB_CACHE_BACKEND": "json",
+            "ABUSEIPDB_CACHE_FILE": str(tmp_path / "cache.db"),
             "ABUSEIPDB_DRY_RUN": "true",
         }
         env.update(env_overrides)

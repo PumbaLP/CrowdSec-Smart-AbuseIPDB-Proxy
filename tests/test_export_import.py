@@ -42,18 +42,18 @@ def test_export_includes_metadata(proxy):
     assert "exported_at" in data
 
 
-def test_export_works_regardless_of_active_backend(make_proxy, tmp_path):
-    sqlite_proxy = make_proxy(ABUSEIPDB_CACHE_BACKEND="sqlite", ABUSEIPDB_CACHE_FILE=str(tmp_path / "c.db"))
-    sqlite_proxy.save_cache({"reports": {"1.1.1.1": {"time": 1, "severity": 1}},
+def test_export_import_round_trips_between_two_separate_caches(make_proxy, tmp_path):
+    source_proxy = make_proxy(ABUSEIPDB_CACHE_FILE=str(tmp_path / "source.db"))
+    source_proxy.save_cache({"reports": {"1.1.1.1": {"time": 1, "severity": 1}},
                               "pending": {}, "retry_queue": {}})
 
-    snapshot = sqlite_proxy.export_cache_json()
+    snapshot = source_proxy.export_cache_json()
 
-    json_proxy = make_proxy(ABUSEIPDB_CACHE_BACKEND="json", ABUSEIPDB_CACHE_FILE=str(tmp_path / "c.json"))
-    imported = json_proxy.import_cache_json(snapshot)
-    json_proxy.save_cache(imported)
+    target_proxy = make_proxy(ABUSEIPDB_CACHE_FILE=str(tmp_path / "target.db"))
+    imported = target_proxy.import_cache_json(snapshot)
+    target_proxy.save_cache(imported)
 
-    assert json_proxy.load_cache()["reports"] == {"1.1.1.1": {"time": 1, "severity": 1}}
+    assert target_proxy.load_cache()["reports"] == {"1.1.1.1": {"time": 1, "severity": 1}}
 
 
 def test_import_rejects_invalid_json(proxy):
@@ -95,8 +95,7 @@ def test_cli_export_to_stdout(tmp_path, monkeypatch):
     env = {k: v for k, v in os.environ.items() if not k.startswith("ABUSEIPDB_")}
     env["ABUSEIPDB_API_KEY"] = "test-key"
     env["ABUSEIPDB_DRY_RUN"] = "true"
-    env["ABUSEIPDB_CACHE_BACKEND"] = "json"
-    env["ABUSEIPDB_CACHE_FILE"] = str(tmp_path / "cache.json")
+    env["ABUSEIPDB_CACHE_FILE"] = str(tmp_path / "cache.db")
 
     result = run("--export", env=env)
     assert result.returncode == 0
@@ -109,13 +108,18 @@ def test_cli_export_to_file_then_import_round_trip(tmp_path):
     env = {k: v for k, v in os.environ.items() if not k.startswith("ABUSEIPDB_")}
     env["ABUSEIPDB_API_KEY"] = "test-key"
     env["ABUSEIPDB_DRY_RUN"] = "true"
-    env["ABUSEIPDB_CACHE_BACKEND"] = "json"
-    env["ABUSEIPDB_CACHE_FILE"] = str(tmp_path / "source.json")
+    env["ABUSEIPDB_CACHE_FILE"] = str(tmp_path / "source.db")
 
-    # Seed the source cache directly (no CLI flag for that — write it ourselves).
-    (tmp_path / "source.json").write_text(json.dumps({
-        "reports": {"9.9.9.9": {"time": 1, "severity": 1}}, "pending": {}, "retry_queue": {},
-    }))
+    # Seed the source cache directly via the sqlite helper (no CLI flag for
+    # writing a single entry — go straight to the storage layer).
+    import sqlite3
+    conn = sqlite3.connect(str(tmp_path / "source.db"))
+    conn.execute("CREATE TABLE IF NOT EXISTS reports (ip TEXT PRIMARY KEY, time INTEGER NOT NULL, severity INTEGER NOT NULL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS pending (ip TEXT PRIMARY KEY, due_time INTEGER NOT NULL, severity INTEGER NOT NULL, categories TEXT NOT NULL, comment TEXT NOT NULL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS retry_queue (ip TEXT PRIMARY KEY, due_time INTEGER NOT NULL, categories TEXT NOT NULL, comment TEXT NOT NULL, attempts INTEGER NOT NULL)")
+    conn.execute("INSERT INTO reports (ip, time, severity) VALUES ('9.9.9.9', 1, 1)")
+    conn.commit()
+    conn.close()
 
     export_path = tmp_path / "export.json"
     result = run("--export", str(export_path), env=env)
@@ -123,12 +127,14 @@ def test_cli_export_to_file_then_import_round_trip(tmp_path):
     assert export_path.exists()
 
     target_env = dict(env)
-    target_env["ABUSEIPDB_CACHE_FILE"] = str(tmp_path / "target.json")
+    target_env["ABUSEIPDB_CACHE_FILE"] = str(tmp_path / "target.db")
     result = run("--import", str(export_path), "-y", env=target_env)
     assert result.returncode == 0
 
-    imported = json.loads((tmp_path / "target.json").read_text())
-    assert imported["reports"] == {"9.9.9.9": {"time": 1, "severity": 1}}
+    conn = sqlite3.connect(str(tmp_path / "target.db"))
+    imported = list(conn.execute("SELECT ip, time, severity FROM reports"))
+    conn.close()
+    assert imported == [("9.9.9.9", 1, 1)]
 
 
 def test_cli_import_without_yes_prompts_and_aborts_on_no(tmp_path):
@@ -136,8 +142,7 @@ def test_cli_import_without_yes_prompts_and_aborts_on_no(tmp_path):
     env = {k: v for k, v in os.environ.items() if not k.startswith("ABUSEIPDB_")}
     env["ABUSEIPDB_API_KEY"] = "test-key"
     env["ABUSEIPDB_DRY_RUN"] = "true"
-    env["ABUSEIPDB_CACHE_BACKEND"] = "json"
-    env["ABUSEIPDB_CACHE_FILE"] = str(tmp_path / "cache.json")
+    env["ABUSEIPDB_CACHE_FILE"] = str(tmp_path / "cache.db")
 
     export_path = tmp_path / "export.json"
     export_path.write_text(json.dumps({
@@ -148,7 +153,7 @@ def test_cli_import_without_yes_prompts_and_aborts_on_no(tmp_path):
     result = run("--import", str(export_path), env=env, input="n\n")
     assert result.returncode == 1
     assert "Aborted" in result.stdout
-    assert not (tmp_path / "cache.json").exists()  # nothing written
+    assert not (tmp_path / "cache.db").exists()  # nothing written
 
 
 def test_cli_import_rejects_malformed_file(tmp_path):
@@ -156,7 +161,7 @@ def test_cli_import_rejects_malformed_file(tmp_path):
     env = {k: v for k, v in os.environ.items() if not k.startswith("ABUSEIPDB_")}
     env["ABUSEIPDB_API_KEY"] = "test-key"
     env["ABUSEIPDB_DRY_RUN"] = "true"
-    env["ABUSEIPDB_CACHE_FILE"] = str(tmp_path / "cache.json")
+    env["ABUSEIPDB_CACHE_FILE"] = str(tmp_path / "cache.db")
 
     bad_path = tmp_path / "not-an-export.json"
     bad_path.write_text('{"hello": "world"}')
@@ -171,7 +176,7 @@ def test_cli_import_reports_missing_file_cleanly(tmp_path):
     env = {k: v for k, v in os.environ.items() if not k.startswith("ABUSEIPDB_")}
     env["ABUSEIPDB_API_KEY"] = "test-key"
     env["ABUSEIPDB_DRY_RUN"] = "true"
-    env["ABUSEIPDB_CACHE_FILE"] = str(tmp_path / "cache.json")
+    env["ABUSEIPDB_CACHE_FILE"] = str(tmp_path / "cache.db")
 
     result = run("--import", str(tmp_path / "does-not-exist.json"), "-y", env=env)
     assert result.returncode == 1

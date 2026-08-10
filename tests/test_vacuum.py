@@ -18,25 +18,9 @@ def run(*args, env=None):
     )
 
 
-def test_no_op_on_json_backend(proxy):
-    # `proxy` fixture defaults to the JSON backend.
-    result = proxy.vacuum_cache()
-    assert result is None
-
-
-def test_no_op_on_json_backend_does_not_touch_the_file(proxy):
-    proxy.save_cache({"reports": {"1.1.1.1": {"time": 1, "severity": 1}}, "pending": {}, "retry_queue": {}})
-    before = proxy.load_cache()
-    proxy.vacuum_cache()
-    assert proxy.load_cache() == before
-
-
 @pytest.fixture
 def sqlite_proxy(make_proxy, tmp_path):
-    return make_proxy(
-        ABUSEIPDB_CACHE_BACKEND="sqlite",
-        ABUSEIPDB_CACHE_FILE=str(tmp_path / "cache.db"),
-    )
+    return make_proxy(ABUSEIPDB_CACHE_FILE=str(tmp_path / "cache.db"))
 
 
 def test_prunes_reports_older_than_24h(sqlite_proxy):
@@ -128,18 +112,6 @@ def test_cli_vacuum_on_sqlite_backend(tmp_path):
     assert result.returncode == 0
     assert "Vacuumed SQLite cache" in result.stderr
     assert (tmp_path / "cache.db").exists()
-
-
-def test_cli_vacuum_on_json_backend_is_a_clean_no_op(tmp_path):
-    env = {k: v for k, v in os.environ.items() if not k.startswith("ABUSEIPDB_")}
-    env["ABUSEIPDB_API_KEY"] = "test-key"
-    env["ABUSEIPDB_DRY_RUN"] = "true"
-    env["ABUSEIPDB_CACHE_BACKEND"] = "json"
-    env["ABUSEIPDB_CACHE_FILE"] = str(tmp_path / "cache.json")
-
-    result = run("--vacuum", env=env)
-    assert result.returncode == 0
-    assert "only applies to the SQLite cache backend" in result.stderr
 
 
 def test_cli_vacuum_does_not_require_an_api_key(tmp_path):
