@@ -178,6 +178,35 @@ def test_matrix_request_shape_and_auth(proxy, monkeypatch):
     assert "hi from the proxy" in captured["body"]["body"]
 
 
+def test_matrix_txn_id_is_unique_across_rapid_calls(proxy, monkeypatch):
+    # Regression test: txn_id used to be a plain millisecond timestamp —
+    # two notify() calls landing in the same millisecond (easily possible
+    # since notify() fires backends in separate threads) would collide,
+    # and Matrix silently drops a repeated txn_id as a retry instead of
+    # sending it as a new message.
+    monkeypatch.setattr(proxy, "MATRIX_HOMESERVER_URL", "https://matrix.example.com")
+    monkeypatch.setattr(proxy, "MATRIX_ACCESS_TOKEN", "secret-token")
+    monkeypatch.setattr(proxy, "MATRIX_ROOM_ID", "!abc123:matrix.example.com")
+    urls = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def read(self):
+            return b""
+
+    monkeypatch.setattr(proxy.urllib.request, "urlopen",
+                         lambda req, timeout=10: (urls.append(req.full_url), FakeResponse())[1])
+
+    for _ in range(50):
+        proxy._notify_matrix("test", "normal")
+
+    txn_ids = [u.rsplit("/", 1)[-1] for u in urls]
+    assert len(set(txn_ids)) == 50  # every single one unique
+
+
 def test_matrix_requires_all_three_settings(proxy, monkeypatch):
     # Only the homeserver is set — missing token/room, so notify() must
     # not attempt to post (would just 401/404).

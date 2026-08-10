@@ -190,6 +190,24 @@ def test_reconcile_reports_only_missing_ips(make_proxy):
     assert "2.2.2.2" in p.load_cache()["reports"]
 
 
+def test_reconcile_duplicate_ip_in_active_decisions_only_counted_once(make_proxy):
+    # Regression test: known_ips used to be a static snapshot taken once
+    # before the loop — if the same IP appeared twice in active_decisions
+    # (overlapping decisions from different scenarios), it'd get counted
+    # (and appear in the notification) twice, even though process_alert()
+    # itself always correctly dedupes the actual report.
+    p = make_proxy(ABUSEIPDB_CROWDSEC_BOUNCER_KEY="test-bouncer-key")
+    p.fetch_crowdsec_active_decisions = lambda: [
+        ("2.2.2.2", "crowdsecurity/ssh-bf"),
+        ("2.2.2.2", "crowdsecurity/http-probing"),
+    ]
+
+    result = p.run_reconcile()
+
+    assert result["reconciled"] == ["2.2.2.2"]
+    assert result["reconciled_count"] == 1
+
+
 def test_reconcile_uses_real_scenario_categories(make_proxy):
     p = make_proxy(ABUSEIPDB_CROWDSEC_BOUNCER_KEY="test-bouncer-key")
     p.fetch_crowdsec_active_decisions = lambda: [("2.2.2.2", "crowdsecurity/mysql-bf")]

@@ -198,3 +198,42 @@ def test_whitelist_check_failure_fails_open(make_proxy, monkeypatch):
 
     # a broken /v2/check must never block a legitimate report
     assert p.is_whitelisted("1.1.1.1") is False
+
+
+def test_whitelist_cache_evicts_expired_entries_on_write(make_proxy, monkeypatch):
+    # Regression test: _whitelist_cache used to grow forever (one entry
+    # per unique IP ever checked, never evicted) — a slow memory leak on
+    # any long-running instance with SKIP_WHITELISTED on and a lot of
+    # distinct source IPs (a honeypot-style setup being the realistic
+    # case). Entries older than the TTL should get swept out as new
+    # checks come in, not pile up indefinitely.
+    p = make_proxy(ABUSEIPDB_SKIP_WHITELISTED="true", ABUSEIPDB_DRY_RUN="false",
+                    ABUSEIPDB_WHITELIST_CACHE_TTL="100")
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+        def read(self):
+            return json.dumps(self._payload).encode("utf-8")
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=10):
+        return FakeResponse({"data": {"isWhitelisted": False}})
+
+    monkeypatch.setattr(p.urllib.request, "urlopen", fake_urlopen)
+
+    p.is_whitelisted("1.1.1.1")
+    assert "1.1.1.1" in p._whitelist_cache
+
+    # simulate the first entry having aged past the TTL, then check a
+    # brand-new IP — that write should sweep the stale one out
+    ip, (whitelisted, checked_at) = "1.1.1.1", p._whitelist_cache["1.1.1.1"]
+    p._whitelist_cache["1.1.1.1"] = (whitelisted, checked_at - 200)
+
+    p.is_whitelisted("2.2.2.2")
+
+    assert "1.1.1.1" not in p._whitelist_cache
+    assert "2.2.2.2" in p._whitelist_cache

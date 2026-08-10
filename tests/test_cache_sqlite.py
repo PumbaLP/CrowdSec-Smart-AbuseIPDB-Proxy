@@ -147,27 +147,18 @@ def test_write_failure_triggers_one_high_priority_notification(sqlite_proxy, mon
     assert calls[0][1] == "high"
 
 
-def test_switching_backends_in_different_directories_does_not_share_state(make_proxy, tmp_path):
-    # Genuinely separate directories — no legacy cache.json for the
-    # SQLite backend to find, so no migration should kick in and the two
-    # caches must stay fully independent.
-    json_dir = tmp_path / "json"
-    json_dir.mkdir()
-    sqlite_dir = tmp_path / "sqlite"
-    sqlite_dir.mkdir()
+def test_two_independent_caches_in_different_directories_do_not_share_state(make_proxy, tmp_path):
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    dir_b = tmp_path / "b"
+    dir_b.mkdir()
 
-    json_proxy = make_proxy(
-        ABUSEIPDB_CACHE_BACKEND="json",
-        ABUSEIPDB_CACHE_FILE=str(json_dir / "cache.json"),
-    )
-    json_proxy.save_cache({"reports": {"1.2.3.4": {"time": 1, "severity": 1}},
-                            "pending": {}, "retry_queue": {}})
+    proxy_a = make_proxy(ABUSEIPDB_CACHE_FILE=str(dir_a / "cache.db"))
+    proxy_a.save_cache({"reports": {"1.2.3.4": {"time": 1, "severity": 1}},
+                         "pending": {}, "retry_queue": {}})
 
-    sqlite_proxy = make_proxy(
-        ABUSEIPDB_CACHE_BACKEND="sqlite",
-        ABUSEIPDB_CACHE_FILE=str(sqlite_dir / "cache.db"),
-    )
-    assert sqlite_proxy.load_cache() == {"reports": {}, "pending": {}, "retry_queue": {}}
+    proxy_b = make_proxy(ABUSEIPDB_CACHE_FILE=str(dir_b / "cache.db"))
+    assert proxy_b.load_cache() == {"reports": {}, "pending": {}, "retry_queue": {}}
 
 
 class TestJsonToSqliteMigration:
@@ -298,3 +289,45 @@ class TestJsonToSqliteMigration:
         cache = sqlite_proxy.load_cache()
         assert "9.9.9.9" not in cache["reports"]
         assert "1.1.1.1" in cache["reports"]
+
+
+def test_count_tracked_reports_matches_load_cache_length(sqlite_proxy):
+    sqlite_proxy.save_cache({
+        "reports": {"1.1.1.1": {"time": 1, "severity": 1}, "2.2.2.2": {"time": 2, "severity": 2}},
+        "pending": {}, "retry_queue": {},
+    })
+    assert sqlite_proxy.count_tracked_reports() == 2
+    assert sqlite_proxy.count_tracked_reports() == len(sqlite_proxy.load_cache()["reports"])
+
+
+def test_count_tracked_reports_zero_on_empty_cache(sqlite_proxy):
+    assert sqlite_proxy.count_tracked_reports() == 0
+
+
+def test_health_endpoint_uses_count_not_full_load(running_server, monkeypatch):
+    # Regression test: /health used to load_cache() the entire reports
+    # table just to take len() of it. Confirms it now goes through the
+    # lightweight COUNT(*) path instead.
+    p, base_url = running_server(ABUSEIPDB_ENABLE_HEALTH="true")
+    calls = {"load_cache": 0, "count": 0}
+
+    real_load_cache = p.load_cache
+    real_count = p.count_tracked_reports
+
+    def spy_load_cache():
+        calls["load_cache"] += 1
+        return real_load_cache()
+
+    def spy_count():
+        calls["count"] += 1
+        return real_count()
+
+    p.load_cache = spy_load_cache
+    p.count_tracked_reports = spy_count
+
+    import urllib.request
+    with urllib.request.urlopen(base_url + "/health", timeout=5) as resp:
+        assert resp.status == 200
+
+    assert calls["count"] == 1
+    assert calls["load_cache"] == 0

@@ -126,6 +126,31 @@ def test_server_survives_malformed_concurrent_requests(running_server):
     assert status == 200
 
 
+def test_malformed_content_length_header_gets_a_clean_500(running_server):
+    """Regression test: int(Content-Length) used to run outside the
+    try/except, so a garbage header value (as opposed to a garbage body,
+    which was already handled) would raise unhandled instead of getting
+    the same clean 500 response every other malformed-input case gets."""
+    p, base_url = running_server()
+    port = int(base_url.rsplit(":", 1)[1])
+
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.putrequest("POST", "/")
+    conn.putheader("Content-Length", "not-a-number")
+    conn.endheaders()
+    resp = conn.getresponse()
+    status = resp.status
+    resp.read()
+    conn.close()
+
+    assert status == 500
+
+    # server must still be healthy afterwards
+    status2, _ = _post(base_url, "1.2.3.201")
+    assert status2 == 200
+
+
 def test_max_concurrent_requests_rejects_with_503_over_the_limit(running_server):
     p, base_url = running_server(ABUSEIPDB_MAX_CONCURRENT_REQUESTS="3")
 
