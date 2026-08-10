@@ -46,9 +46,7 @@ jobs:
         with:
           images: ${{ steps.image.outputs.name }}
           tags: |
-            type=semver,pattern={{version}},value=${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || '' }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || '' }}
-            type=semver,pattern={{major}},value=${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || '' }}
+            type=raw,value=${{ github.event.workflow_run.head_branch }},enable=${{ github.event_name == 'workflow_run' && startsWith(github.event.workflow_run.head_branch, 'v') }}
             type=raw,value=latest
             type=sha,format=long
 
