@@ -26,9 +26,10 @@ import os
 import sqlite3
 import sys
 import threading
+import uuid
 from datetime import datetime, timezone
 
-VERSION = "2.9.0"
+VERSION = "3.0.1"
 
 START_TIME = time.time()
 
@@ -44,32 +45,44 @@ LISTEN_ADDRESS = os.getenv("ABUSEIPDB_LISTEN_ADDRESS", "127.0.0.1")
 # Persistent cache path, survives reboots. Directory must exist
 # (the install script creates it, otherwise: mkdir -p /var/lib/abuseipdb-proxy)
 #
-# Backend: "sqlite" (default since v2.0.0 — a real database with one
-# table per section, WAL journal + NORMAL sync by default, which is a
-# good balance of speed/write-amplification on an SSD and safe against a
-# crash mid-write) or "json" (a single file rewritten atomically on every
-# save — simpler to inspect by hand, fine for small setups). An existing
-# v1.x cache.json is migrated into the new SQLite cache automatically the
-# first time this runs (see _migrate_json_to_sqlite_if_needed below); the
-# old file is kept as a .migrated backup, never deleted.
-CACHE_BACKEND = os.getenv("ABUSEIPDB_CACHE_BACKEND", "sqlite").strip().lower()
-if CACHE_BACKEND not in ("json", "sqlite"):
+# SQLite is the only cache backend as of 3.0.0 (ABUSEIPDB_CACHE_BACKEND=json
+# was removed — see CHANGELOG.md and --migrate-to-sqlite). The variable is
+# kept (rather than deleted outright) purely for display in --check-config/
+# --doctor/--stats output, and so a leftover ABUSEIPDB_CACHE_BACKEND=json in
+# an old env file degrades gracefully into a loud warning instead of a
+# confusing error about an unrecognized setting.
+_cache_backend_setting = os.getenv("ABUSEIPDB_CACHE_BACKEND", "sqlite").strip().lower()
+if _cache_backend_setting != "sqlite":
     # Deliberately not using log() here — it isn't defined yet this early
     # in the file (same reason _validated_pragma below uses a raw write).
-    # This one matters more than a bad PRAGMA value would: silently
-    # falling through to the JSON code path against a filename picked for
-    # SQLite (or vice versa) would mean reading/writing garbage, not just
-    # a suboptimal setting.
     sys.stderr.write(
-        f"[abuseipdb-proxy] Invalid ABUSEIPDB_CACHE_BACKEND={CACHE_BACKEND!r}, "
-        f"expected 'json' or 'sqlite'. Falling back to 'sqlite'.\n"
+        f"[abuseipdb-proxy] ABUSEIPDB_CACHE_BACKEND={_cache_backend_setting!r} is no longer "
+        f"supported — SQLite has been the only cache backend since 3.0.0. Continuing with "
+        f"SQLite. If you're upgrading from a json-backend install: your existing cache.json "
+        f"has NOT been touched, but starting fresh with an empty SQLite cache means a burst "
+        f"of duplicate reports until it repopulates. Run "
+        f"'abuseipdb_proxy.py --migrate-to-sqlite /path/to/cache.json' first, point "
+        f"ABUSEIPDB_CACHE_FILE at the resulting .db file, then remove "
+        f"ABUSEIPDB_CACHE_BACKEND from your config entirely (sqlite is the only option now).\n"
     )
-    CACHE_BACKEND = "sqlite"
-_DEFAULT_CACHE_FILE = (
-    "/var/lib/abuseipdb-proxy/cache.json" if CACHE_BACKEND == "json"
-    else "/var/lib/abuseipdb-proxy/cache.db"
-)
-CACHE_FILE = os.getenv("ABUSEIPDB_CACHE_FILE", _DEFAULT_CACHE_FILE)
+CACHE_BACKEND = "sqlite"
+CACHE_FILE = os.getenv("ABUSEIPDB_CACHE_FILE", "/var/lib/abuseipdb-proxy/cache.db")
+if CACHE_FILE.endswith(".json"):
+    # Never open a JSON-formatted file as a SQLite database, no matter how
+    # CACHE_FILE ended up pointing at one (an old env file left over from
+    # before 3.0.0 is the realistic case). Redirect to a sibling .db path
+    # instead of guessing wrong and corrupting/crashing on first write.
+    _safe_cache_file = CACHE_FILE[:-len(".json")] + ".db"
+    sys.stderr.write(
+        f"[abuseipdb-proxy] ABUSEIPDB_CACHE_FILE={CACHE_FILE!r} ends in .json, which can "
+        f"never be a valid SQLite database — using {_safe_cache_file!r} instead so a "
+        f"JSON-formatted file is never mistakenly opened as SQLite. Run "
+        f"'abuseipdb_proxy.py --migrate-to-sqlite {CACHE_FILE} {_safe_cache_file}' to bring "
+        f"your existing report history across (the original file is left untouched either way), "
+        f"then update ABUSEIPDB_CACHE_FILE to {_safe_cache_file!r} to make this permanent and "
+        f"silence this warning.\n"
+    )
+    CACHE_FILE = _safe_cache_file
 
 # SQLite PRAGMAs, adjustable for storage that doesn't behave like an SSD
 # (e.g. an SD card, where NORMAL synchronous + WAL can still be the right
@@ -274,12 +287,12 @@ def categories_for_scenario(scenario):
 
 # Off by default: querying AbuseIPDB's own /v2/check endpoint before every
 # report costs a separate daily quota from /v2/report, and adds a
-# synchronous network round-trip on the request path (the proxy's HTTP
-# server is single-threaded, so a slow check briefly delays whatever's
-# next in line — mitigated by the per-IP cache below, but worth knowing
-# before enabling this on a high-traffic setup). When on, skips reporting
-# an IP AbuseIPDB itself already marks as "isWhitelisted" (e.g. well-known
-# crawlers/CDNs that opted in) — no point spending report quota on those.
+# synchronous network round-trip on the request path (mitigated by the
+# per-IP cache below and by ThreadingHTTPServer giving each request its
+# own thread since v2.8.0, but still worth knowing before enabling this
+# on a very high-traffic setup). When on, skips reporting an IP AbuseIPDB
+# itself already marks as "isWhitelisted" (e.g. well-known crawlers/CDNs
+# that opted in) — no point spending report quota on those.
 SKIP_WHITELISTED = os.getenv("ABUSEIPDB_SKIP_WHITELISTED", "false").strip().lower() in ("1", "true", "yes")
 WHITELIST_CACHE_TTL = int(os.getenv("ABUSEIPDB_WHITELIST_CACHE_TTL", "86400"))
 
@@ -523,9 +536,15 @@ def _notify_matrix(message, priority):
     try:
         # Matrix has no webhooks of its own: post directly via the
         # Client-Server API's "send message event" endpoint. The
-        # transaction ID just needs to be unique per request from this
-        # client, so a millisecond timestamp is sufficient here.
-        txn_id = str(int(time.time() * 1000))
+        # transaction ID only has to be unique per request from this
+        # client — a plain millisecond timestamp isn't quite enough for
+        # that: two notify() calls close enough together to land in the
+        # same millisecond (easily possible; notify() fires each backend
+        # in its own thread) would collide, and Matrix treats a repeated
+        # txn_id as a retry of the same request, silently dropping the
+        # second message instead of sending it. A UUID has no such
+        # collision risk.
+        txn_id = uuid.uuid4().hex
         url = (
             f"{MATRIX_HOMESERVER_URL}/_matrix/client/v3/rooms/"
             f"{urllib.parse.quote(MATRIX_ROOM_ID)}/send/m.room.message/{txn_id}"
@@ -753,59 +772,32 @@ def load_cache():
       "retry_queue": {ip: {"due_time": epoch, "categories": str,
                             "comment": str, "attempts": int}}
     }
-    regardless of which backend (JSON file or SQLite database) is active.
     """
-    if CACHE_BACKEND == "sqlite":
-        return _load_cache_sqlite()
-    return _load_cache_json()
+    return _load_cache_sqlite()
+
+
+def count_tracked_reports():
+    """A single COUNT(*) instead of load_cache() + len(...) — used by
+    /health, which can be polled frequently by monitoring and has no
+    reason to materialize every tracked report into Python objects just
+    to throw all but the count away."""
+    conn = _sqlite_connect()
+    try:
+        return conn.execute("SELECT COUNT(*) FROM reports").fetchone()[0]
+    finally:
+        conn.close()
 
 
 def save_cache(cache):
     global _cache_write_failing
     try:
-        if CACHE_BACKEND == "sqlite":
-            _save_cache_sqlite(cache)
-        else:
-            _save_cache_json(cache)
+        _save_cache_sqlite(cache)
         _cache_write_failing = False
     except Exception as e:
         log(f"Failed to write cache: {e}", level="error")
         if not _cache_write_failing:
             _cache_write_failing = True
             notify(f"Failed to write cache file at {CACHE_FILE}: {e}", priority="high")
-
-
-def _load_cache_json():
-    """
-    Older versions of this script wrote a flat {ip: {"time", "severity"}}
-    structure with no "pending"/"retry_queue" sections, or (v1.1.0) a
-    structure without "retry_queue". Both are transparently upgraded on
-    first load.
-    """
-    if not os.path.exists(CACHE_FILE):
-        return {"reports": {}, "pending": {}, "retry_queue": {}}
-    try:
-        with open(CACHE_FILE, "r") as f:
-            data = json.load(f)
-    except Exception:
-        return {"reports": {}, "pending": {}, "retry_queue": {}}
-
-    if "reports" in data or "pending" in data or "retry_queue" in data:
-        data.setdefault("reports", {})
-        data.setdefault("pending", {})
-        data.setdefault("retry_queue", {})
-        return data
-
-    # Legacy flat format (v1.0.0): the whole dict was the "reports" map.
-    return {"reports": data, "pending": {}, "retry_queue": {}}
-
-
-def _save_cache_json(cache):
-    ensure_cache_dir()
-    tmp_path = CACHE_FILE + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(cache, f)
-    os.replace(tmp_path, CACHE_FILE)
 
 
 _SQLITE_SCHEMA = """
@@ -951,7 +943,7 @@ def _save_cache_sqlite(cache, path=None):
     try:
         with conn:  # single transaction: either the whole cache is
                     # replaced, or (on error) none of it is — same
-                    # all-or-nothing guarantee the atomic JSON rename gives
+                    # all-or-nothing guarantee the atomic JSON rename gave
             conn.execute("DELETE FROM reports")
             conn.executemany(
                 "INSERT INTO reports (ip, time, severity) VALUES (?, ?, ?)",
@@ -1124,6 +1116,16 @@ def is_whitelisted(ip):
 
     with _whitelist_cache_lock:
         _whitelist_cache[ip] = (whitelisted, now)
+        # Opportunistic eviction on every write, not a separate periodic
+        # task: keeps this bounded to roughly "unique IPs checked in the
+        # last TTL window" instead of growing for as long as the process
+        # stays up. Without this, a long-running instance with a lot of
+        # distinct source IPs (a honeypot-style setup is exactly the case
+        # the README calls out for ABUSEIPDB_SKIP_WHITELISTED) would leak
+        # one small tuple per never-seen-again IP for its entire uptime.
+        expired = [k for k, (_, checked_at) in _whitelist_cache.items() if now - checked_at >= WHITELIST_CACHE_TTL]
+        for k in expired:
+            del _whitelist_cache[k]
     return whitelisted
 
 
@@ -1524,10 +1526,10 @@ class AbuseIPDBHandler(http.server.BaseHTTPRequestHandler):
                 _request_semaphore.release()
 
     def _handle_post(self):
-        content_length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(content_length)
-
         try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+
             data = json.loads(body.decode('utf-8'))
             ip = data.get("ip")
             categories = data.get("categories", "15").strip()
@@ -1572,8 +1574,6 @@ class AbuseIPDBHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
     def _handle_health(self):
-        with lock:
-            cache = load_cache()
         with quota_lock:
             quota = dict(quota_state)
         body = json.dumps({
@@ -1581,7 +1581,7 @@ class AbuseIPDBHandler(http.server.BaseHTTPRequestHandler):
             "version": VERSION,
             "dry_run": DRY_RUN,
             "uptime_seconds": int(time.time() - START_TIME),
-            "cache_reports_tracked": len(cache.get("reports", {})),
+            "cache_reports_tracked": count_tracked_reports(),
             "pending_escalations": len(pending_timers),
             "pending_retries": len(retry_timers),
             "abuseipdb_quota": quota,
@@ -1664,9 +1664,8 @@ EXPORT_FORMAT_VERSION = 1
 
 
 def export_cache_json():
-    """Portable, backend-agnostic snapshot of the current cache (works the
-    same whether the active backend is JSON or SQLite) — for backups or
-    moving the report history to a different host."""
+    """Portable snapshot of the current cache — for backups or moving the
+    report history to a different host."""
     with lock:
         cache = load_cache()
     return json.dumps({
@@ -1713,15 +1712,8 @@ def vacuum_cache():
     process_alert() already applies lazily whenever a new alert comes
     in) and then VACUUMs the SQLite file to reclaim the space freed by
     that prune, plus space fragmented by the continuous DELETE+INSERT
-    churn every save_cache() call does under the hood. Safe to run
-    anytime; a no-op (with a clear message, not an error) on the JSON
-    backend, since VACUUM is a SQLite-specific concept.
+    churn every save_cache() call does under the hood.
     """
-    if CACHE_BACKEND != "sqlite":
-        log(f"--vacuum only applies to the SQLite cache backend (current backend: {CACHE_BACKEND}). "
-            "Nothing to do.")
-        return None
-
     size_before = os.path.getsize(CACHE_FILE) if os.path.exists(CACHE_FILE) else 0
 
     with lock:
@@ -1961,14 +1953,12 @@ def check_config():
         ok("ABUSEIPDB_API_KEY is set" + (" (from ABUSEIPDB_API_KEY_FILE)" if os.getenv("ABUSEIPDB_API_KEY_FILE", "").strip() else ""))
 
     # --- Cache ---
-    if CACHE_BACKEND not in ("json", "sqlite"):
-        fail(f"ABUSEIPDB_CACHE_BACKEND={CACHE_BACKEND!r} is invalid (must be 'json' or 'sqlite')")
-    elif CACHE_BACKEND == "json":
-        warn(f"Cache backend: json ({CACHE_FILE}) — deprecated, will be removed in 3.0.0. "
-             f"Run 'abuseipdb_proxy.py --migrate-to-sqlite' to switch, then set "
-             f"ABUSEIPDB_CACHE_BACKEND=sqlite.")
+    if _cache_backend_setting != "sqlite":
+        warn(f"ABUSEIPDB_CACHE_BACKEND={_cache_backend_setting!r} is no longer supported "
+             f"(SQLite has been the only backend since 3.0.0) — running with sqlite anyway. "
+             f"Remove ABUSEIPDB_CACHE_BACKEND from your config to silence this.")
     else:
-        ok(f"Cache backend: {CACHE_BACKEND} ({CACHE_FILE})")
+        ok(f"Cache backend: sqlite ({CACHE_FILE})")
     try:
         ensure_cache_dir()
         cache_dir = os.path.dirname(CACHE_FILE) or "."
@@ -1978,8 +1968,7 @@ def check_config():
             fail(f"Cache directory is not writable: {cache_dir}")
     except OSError as e:
         fail(f"Cache directory could not be created: {e}")
-    if CACHE_BACKEND == "sqlite":
-        ok(f"SQLite pragmas: journal_mode={CACHE_SQLITE_JOURNAL_MODE}, synchronous={CACHE_SQLITE_SYNCHRONOUS}")
+    ok(f"SQLite pragmas: journal_mode={CACHE_SQLITE_JOURNAL_MODE}, synchronous={CACHE_SQLITE_SYNCHRONOUS}")
 
     # --- Networking ---
     if not (1 <= LISTEN_PORT <= 65535):
@@ -2320,30 +2309,22 @@ def format_doctor_output(results):
 BACKUP_RETENTION = int(os.getenv("ABUSEIPDB_BACKUP_RETENTION", "14"))
 
 
-def run_migrate_to_sqlite(target_path=None):
+def run_migrate_to_sqlite(source_path, target_path=None):
     """
-    One-shot migration for ABUSEIPDB_CACHE_BACKEND=json users (deprecated,
-    removed entirely in 3.0.0): reads the currently-configured JSON cache
-    and writes it into a SQLite database, without touching the live
-    ABUSEIPDB_CACHE_BACKEND setting — that's a config change the person
-    makes themselves afterward, once they've confirmed the migration
-    looks right. Safe to re-run: it only ever reads the JSON file, never
-    modifies or deletes it.
+    One-shot migration off the JSON cache format — its backend support was
+    removed entirely in 3.0.0, so this takes an explicit source path
+    rather than reading it from ABUSEIPDB_CACHE_BACKEND/ABUSEIPDB_CACHE_FILE
+    (there's nothing for those to point at anymore). Safe to re-run: it
+    only ever reads source_path, never modifies or deletes it.
     """
-    if CACHE_BACKEND != "json":
-        return {
-            "error": f"ABUSEIPDB_CACHE_BACKEND is already {CACHE_BACKEND!r} — nothing to migrate. "
-                     f"This only migrates *from* the json backend."
-        }
-
-    if not os.path.exists(CACHE_FILE):
-        return {"error": f"No JSON cache found at {CACHE_FILE} — nothing to migrate."}
+    if not os.path.exists(source_path):
+        return {"error": f"No file found at {source_path} — nothing to migrate."}
 
     try:
-        with open(CACHE_FILE, "r") as f:
+        with open(source_path, "r") as f:
             data = json.load(f)
     except Exception as e:
-        return {"error": f"Could not read {CACHE_FILE}: {e}"}
+        return {"error": f"Could not read {source_path}: {e}"}
 
     if "reports" in data or "pending" in data or "retry_queue" in data:
         data.setdefault("reports", {})
@@ -2353,13 +2334,13 @@ def run_migrate_to_sqlite(target_path=None):
         data = {"reports": data, "pending": {}, "retry_queue": {}}  # v1.0.0 flat format
 
     if not target_path:
-        base, _ = os.path.splitext(CACHE_FILE)
-        target_path = base + ".db"
+        base, ext = os.path.splitext(source_path)
+        target_path = base + ".db" if ext else source_path + ".db"
 
     if os.path.exists(target_path):
         return {
             "error": f"{target_path} already exists — refusing to overwrite it. "
-                     f"Pass an explicit --migrate-to-sqlite=PATH to choose a different target, "
+                     f"Pass --migrate-target=PATH to choose a different target, "
                      f"or remove the existing file first if you're sure it's safe to replace."
         }
 
@@ -2370,7 +2351,7 @@ def run_migrate_to_sqlite(target_path=None):
 
     entry_count = sum(len(section) for section in data.values())
     return {
-        "source": CACHE_FILE,
+        "source": source_path,
         "target": target_path,
         "entries": entry_count,
     }
@@ -2502,6 +2483,12 @@ def run_reconcile(as_json=False):
         if t:
             threads.append(t)
         reconciled.append(ip)
+        known_ips.add(ip)  # in case active_decisions ever has the same IP
+                            # twice (overlapping decisions from different
+                            # scenarios) — without this it'd get double-
+                            # counted in the summary/notification, even
+                            # though process_alert()'s own dedup already
+                            # means it's never actually double-reported
 
     # Unlike the live HTTP path (which stays running for hours after
     # firing these off), this is a one-shot CLI run — without waiting
@@ -2659,13 +2646,17 @@ def parse_args():
     )
     parser.add_argument(
         "--migrate-to-sqlite",
-        metavar="PATH", nargs="?", const=None, default="__unset__",
-        help="One-time migration for ABUSEIPDB_CACHE_BACKEND=json setups (deprecated, removed "
-             "in 3.0.0): writes the current JSON cache into a new SQLite database at PATH "
-             "(default: same name as the JSON file with a .db extension) without deleting the "
-             "JSON file or changing your configuration. Refuses to overwrite an existing target "
-             "file. Update ABUSEIPDB_CACHE_BACKEND=sqlite (and ABUSEIPDB_CACHE_FILE if needed) "
-             "afterward.",
+        metavar="SOURCE_JSON_FILE", default="__unset__",
+        help="One-time migration off the JSON cache format (its backend support was removed "
+             "entirely in 3.0.0): reads SOURCE_JSON_FILE (your old cache.json from before "
+             "upgrading) and writes a new SQLite database at --migrate-target (default: same "
+             "name as SOURCE_JSON_FILE with a .db extension), without modifying or deleting the "
+             "source file. Refuses to overwrite an existing target file.",
+    )
+    parser.add_argument(
+        "--migrate-target",
+        metavar="PATH", default=None,
+        help="Target .db path for --migrate-to-sqlite (default: derived from the source filename).",
     )
     return parser.parse_args()
 
@@ -2752,7 +2743,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if args.migrate_to_sqlite != "__unset__":
-        result = run_migrate_to_sqlite(target_path=args.migrate_to_sqlite)
+        result = run_migrate_to_sqlite(args.migrate_to_sqlite, target_path=args.migrate_target)
         if args.json:
             print(json.dumps(result, indent=2))
         elif "error" in result:
@@ -2761,9 +2752,9 @@ if __name__ == "__main__":
             print(
                 f"Migrated {result['entries']} entries from {result['source']} "
                 f"to {result['target']}.\n\n"
-                f"Next: set ABUSEIPDB_CACHE_BACKEND=sqlite and "
-                f"ABUSEIPDB_CACHE_FILE={result['target']} in your env file, then restart. "
-                f"The JSON file was not modified or deleted."
+                f"Next: set ABUSEIPDB_CACHE_FILE={result['target']} in your env file "
+                f"(sqlite is the only cache backend now, no ABUSEIPDB_CACHE_BACKEND needed), "
+                f"then restart. The source file was not modified or deleted."
             )
         sys.exit(1 if "error" in result else 0)
 
@@ -2826,14 +2817,6 @@ if __name__ == "__main__":
 
     if DRY_RUN:
         log("Dry-run mode enabled: no reports will be sent to AbuseIPDB.")
-
-    if CACHE_BACKEND == "json":
-        log(
-            "ABUSEIPDB_CACHE_BACKEND=json is deprecated and will be removed in 3.0.0. "
-            "Run 'abuseipdb_proxy.py --migrate-to-sqlite' to switch over, then set "
-            "ABUSEIPDB_CACHE_BACKEND=sqlite.",
-            level="warning",
-        )
 
     ensure_cache_dir()
     resume_state_from_cache()

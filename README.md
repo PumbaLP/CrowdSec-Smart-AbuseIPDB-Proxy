@@ -122,7 +122,7 @@ cd CrowdSec-Smart-AbuseIPDB-Proxy
 ./update.sh
 ```
 
-**Upgrading from v1.x?** v2.0.0 switches the default cache backend from a single JSON file to SQLite (see `ABUSEIPDB_CACHE_BACKEND` below for why). This runs itself automatically and won't lose any history: the first time the proxy starts after the upgrade, it finds your existing `cache.json`, imports it into the new `cache.db`, and renames the old file to `cache.json.migrated` — kept as a backup, never deleted. Nothing to do on your end; check the log for the "Migration complete" line if you want to confirm it happened. Prefer to stick with the JSON file? Set `ABUSEIPDB_CACHE_BACKEND=json` and nothing changes for you.
+**Upgrading from v1.x?** v2.0.0 switched the default cache backend from a single JSON file to SQLite; v3.0.0 made SQLite the *only* backend (`ABUSEIPDB_CACHE_BACKEND=json` was removed entirely — see the CHANGELOG). If your `cache.json` sits right next to where `cache.db` will be created (the default path), it's imported automatically the first time the proxy starts after the upgrade, and renamed to `cache.json.migrated` — kept as a backup, never deleted. Nothing to do on your end; check the log for the "Migration complete" line if you want to confirm it happened. If your `cache.json` lives at a custom `ABUSEIPDB_CACHE_FILE` path instead, migrate it explicitly first: `abuseipdb_proxy.py --migrate-to-sqlite /path/to/old/cache.json`.
 
 Checks for new commits on `origin/main`, refuses to run if you have uncommitted local changes, shows what changed (including the relevant `CHANGELOG.md` section if the version bumped), then pulls and re-runs `install.sh` for you. Safe to run anytime — does nothing if you're already up to date. Add `-y` to skip the confirmation prompt (e.g. for a cron job).
 
@@ -153,7 +153,7 @@ Removes everything `install.sh` created (service, binary, config, cache, CrowdSe
 
 ## Docker
 
-An alternative to `install.sh` for anyone already running CrowdSec (or willing to) in containers. Everything Docker-related lives in `Docker/`, kept separate from the bare-metal install at the repo root. Pre-built multi-arch images (`linux/amd64`, `linux/arm64` — Raspberry Pi included) are published to GHCR on every release; no local build needed. The image has zero third-party Python dependencies — the proxy is stdlib-only — so it's a small, standard `python:3.13-alpine` build with nothing extra installed; CI builds it and reports the actual size on every push. Resource footprint at runtime is minimal too: a single-threaded process handling occasional alerts, well under 64MB RAM in practice (see the commented `mem_limit`/`cpus` in `Docker/docker-compose.yml` if you want a hard ceiling anyway).
+An alternative to `install.sh` for anyone already running CrowdSec (or willing to) in containers. Everything Docker-related lives in `Docker/`, kept separate from the bare-metal install at the repo root. Pre-built multi-arch images (`linux/amd64`, `linux/arm64` — Raspberry Pi included) are published to GHCR on every release; no local build needed. The image has zero third-party Python dependencies — the proxy is stdlib-only — so it's a small, standard `python:3.13-alpine` build with nothing extra installed; CI builds it and reports the actual size on every push. Resource footprint at runtime is minimal too: well under 64MB RAM in practice for occasional alerts (see the commented `mem_limit`/`cpus` in `Docker/docker-compose.yml` if you want a hard ceiling anyway).
 
 ```bash
 cd Docker
@@ -199,8 +199,7 @@ Any secret-like variable below (API key, tokens, webhook URLs, the shared secret
 | `ABUSEIPDB_API_KEY` | *(required)* | Your AbuseIPDB API key |
 | `ABUSEIPDB_PROXY_PORT` | `9999` | Local port the proxy listens on |
 | `ABUSEIPDB_LISTEN_ADDRESS` | `127.0.0.1` | Interface to bind to. Only change this from the loopback-only default in an isolated environment (e.g. inside Docker's own network — see "Docker" above); never expose it directly to an untrusted network. |
-| `ABUSEIPDB_CACHE_FILE` | `/var/lib/abuseipdb-proxy/cache.db` (or `cache.json` when `ABUSEIPDB_CACHE_BACKEND=json`) | Path to the cache file |
-| `ABUSEIPDB_CACHE_BACKEND` | `sqlite` | `sqlite` (a real database — `reports`/`pending`/`retry_queue` tables, WAL journal, scales well and is queryable with `sqlite3` directly) or `json` (single file, rewritten atomically — simpler to read by hand). An existing v1.x `cache.json` is imported into a fresh SQLite cache automatically on first run; see "Upgrading from v1.x" below. |
+| `ABUSEIPDB_CACHE_FILE` | `/var/lib/abuseipdb-proxy/cache.db` | Path to the SQLite cache database |
 | `ABUSEIPDB_SQLITE_JOURNAL_MODE` | `WAL` | SQLite journal mode. Defaults are already SSD-friendly; rarely worth changing. Only used with the SQLite backend. |
 | `ABUSEIPDB_SQLITE_SYNCHRONOUS` | `NORMAL` | SQLite sync mode. `FULL` trades some write-amplification for extra durability if you're on flaky storage (e.g. an SD card). Only used with the SQLite backend. |
 | `ABUSEIPDB_REPORT_WINDOW` | `905` | Default time window in seconds between reports for the same IP |
@@ -284,14 +283,14 @@ Beyond just running the proxy itself, `abuseipdb_proxy.py` (or `abuseipdb_proxy.
 | `--stats [--json] [--stats-limit N]` | Snapshot of the cache: recent reports, pending escalations, queued retries, AbuseIPDB quota. `--json` for scripting; `--stats-limit` caps the recent-reports list (default 10). |
 | `--export [PATH]` | Export the cache as portable JSON to PATH, or stdout if omitted. |
 | `--import PATH [-y]` | Replace the cache with a JSON snapshot from PATH (or `-` for stdin). Prompts for confirmation unless `-y`/`--yes`. |
-| `--vacuum` | Prune stale reports and reclaim disk space on the SQLite backend. No-op on JSON. |
+| `--vacuum` | Prune stale reports and reclaim disk space in the SQLite cache. |
 | `--backup [DIR]` | Write a timestamped cache snapshot into DIR (default: `backups/` next to the cache file), then prune old backups beyond `ABUSEIPDB_BACKUP_RETENTION` (default 14). Suitable for a periodic timer. |
 | `--check-config [--json]` | Validate the configuration (API key, cache path, alerting backends, timing) with no network access and no changes made. Exit code 1 if anything failed. |
 | `--doctor [--no-network] [--json]` | Everything `--check-config` covers, plus systemd service status, file permissions, CrowdSec `profiles.yaml` wiring, cache readability, whether api.abuseipdb.com is reachable, and (unless `--no-network`) a live self-test — sends a synthetic, always-filtered test alert through the actually running proxy's real HTTP endpoint, confirming the deployed instance is truly listening and working, not just that this CLI invocation's config looks right. Bare-metal-specific checks skip cleanly outside that context (e.g. in Docker). |
 | `--test-notify` | Send a test message to every configured alerting backend. |
 | `--notify MESSAGE [--notify-priority low\|normal\|high]` | Send an arbitrary message through the configured alerting backend(s). Used internally by `update.sh --check-only`. |
 | `--reconcile [--json]` | Compare CrowdSec's currently active decisions against this proxy's report cache and report any that are missing (see "CrowdSec decision reconciliation" below). Suitable for a periodic timer. |
-| `--migrate-to-sqlite [PATH]` | One-time migration off the deprecated `ABUSEIPDB_CACHE_BACKEND=json` (removed in 3.0.0): writes the current JSON cache into a new SQLite database at PATH (default: same name with a `.db` extension), without touching or deleting the JSON file or changing your configuration. Refuses to overwrite an existing target file. Update `ABUSEIPDB_CACHE_BACKEND=sqlite` yourself afterward. |
+| `--migrate-to-sqlite SOURCE_JSON_FILE [--migrate-target PATH]` | One-time migration off the JSON cache format, whose backend support was removed entirely in 3.0.0: reads SOURCE_JSON_FILE (your old `cache.json`) and writes a new SQLite database at `--migrate-target` (default: SOURCE_JSON_FILE with a `.db` extension), without modifying or deleting the source file. Refuses to overwrite an existing target file. |
 
 ## Endpoints
 
@@ -393,7 +392,7 @@ crowdsec-smart-abuseipdb/
 
 - No authentication on the local port by default — not a concern as long as it only listens on `127.0.0.1` (the Docker default of `0.0.0.0` is fine specifically because it stays inside Docker's own network isolation, see "Docker" above). For setups where that boundary is less clean-cut, `ABUSEIPDB_ALLOWED_SOURCE_IPS` and `ABUSEIPDB_SHARED_SECRET` add optional extra layers — see "Configuration" above.
 - The 15-minute default window is configurable per severity tier (`ABUSEIPDB_REPORT_WINDOW_*`) and, since v2.5.0, per category (`ABUSEIPDB_REPORT_WINDOW_CATEGORIES`) — but still not per individual IP.
-- The default SQLite cache scales comfortably to a large report history; the JSON backend (`ABUSEIPDB_CACHE_BACKEND=json`) is **deprecated as of v2.9.0 and will be removed entirely in 3.0.0**. If you're still on it, run `abuseipdb_proxy.py --migrate-to-sqlite` and switch over — see "Configuration" above.
+- The default SQLite cache scales comfortably to a large report history and is the only backend since 3.0.0 (`ABUSEIPDB_CACHE_BACKEND=json` was removed entirely — an old env file still setting it just gets a loud warning, not a crash; see `--migrate-to-sqlite` above if you're migrating from a custom `ABUSEIPDB_CACHE_FILE` path).
 
 ## Contributing
 

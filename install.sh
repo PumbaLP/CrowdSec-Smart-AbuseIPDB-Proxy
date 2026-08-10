@@ -90,9 +90,20 @@ chmod 0700 "${CACHE_DIR}"
 echo "-> Writing API key to ${ENV_PATH} (chmod 600)"
 mkdir -p "${ENV_DIR}"
 chmod 0700 "${ENV_DIR}"
-cat > "${ENV_PATH}" <<EOF
-ABUSEIPDB_API_KEY=${API_KEY}
-EOF
+if [[ -f "${ENV_PATH}" ]]; then
+    # Preserve every other setting already in the file — a plain
+    # overwrite here used to wipe out anything beyond the API key
+    # (bouncer key, allowlists, notification tokens, custom cache paths,
+    # ...) on every single re-run, including every update (update.sh
+    # re-runs this script). grep -v to drop any existing API-key line,
+    # then append the current one; avoids sed substitution entirely so a
+    # key containing a sed-special character can't corrupt the rewrite.
+    grep -v '^ABUSEIPDB_API_KEY=' "${ENV_PATH}" > "${ENV_PATH}.tmp" || true
+    printf 'ABUSEIPDB_API_KEY=%s\n' "${API_KEY}" >> "${ENV_PATH}.tmp"
+    mv "${ENV_PATH}.tmp" "${ENV_PATH}"
+else
+    printf 'ABUSEIPDB_API_KEY=%s\n' "${API_KEY}" > "${ENV_PATH}"
+fi
 chmod 0600 "${ENV_PATH}"
 
 echo "-> Installing systemd service to ${SERVICE_PATH}"
@@ -158,14 +169,9 @@ if [[ -f "${SCRIPT_DIR}/abuseipdb-proxy-update-check.service" && -f "${SCRIPT_DI
 fi
 
 # --- Optional: weekly SQLite vacuum timer ---------------------------------
-# Only offered when the SQLite backend is actually in use (--vacuum is a
-# no-op otherwise, so there's nothing to schedule for a JSON-cache install).
-CACHE_BACKEND_IN_USE="$(grep -m1 '^ABUSEIPDB_CACHE_BACKEND=' "${ENV_PATH}" 2>/dev/null | cut -d= -f2-)"
-if [[ -z "${CACHE_BACKEND_IN_USE}" ]]; then
-    CACHE_BACKEND_IN_USE="sqlite"  # v2.0.0+ default when unset
-fi
-if [[ "${CACHE_BACKEND_IN_USE}" == "sqlite" \
-      && -f "${SCRIPT_DIR}/abuseipdb-proxy-vacuum.service" && -f "${SCRIPT_DIR}/abuseipdb-proxy-vacuum.timer" ]]; then
+# SQLite is the only cache backend since 3.0.0, so this always applies —
+# no more gating on what an env file happens to say ABUSEIPDB_CACHE_BACKEND is.
+if [[ -f "${SCRIPT_DIR}/abuseipdb-proxy-vacuum.service" && -f "${SCRIPT_DIR}/abuseipdb-proxy-vacuum.timer" ]]; then
     echo
     VACUUM_TIMER_ALREADY_ENABLED=false
     if systemctl is-enabled --quiet abuseipdb-proxy-vacuum.timer 2>/dev/null; then

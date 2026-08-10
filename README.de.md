@@ -123,7 +123,7 @@ cd CrowdSec-Smart-AbuseIPDB-Proxy
 ./update.sh
 ```
 
-**Upgrade von v1.x?** v2.0.0 wechselt das Standard-Cache-Backend von einer einzelnen JSON-Datei auf SQLite (siehe `ABUSEIPDB_CACHE_BACKEND` unten fürs Warum). Das passiert automatisch, ohne Datenverlust: beim ersten Start nach dem Upgrade findet der Proxy deine vorhandene `cache.json`, importiert sie in die neue `cache.db` und benennt die alte Datei zu `cache.json.migrated` um – als Backup behalten, nie gelöscht. Du musst nichts tun; im Log steht "Migration complete", falls du's bestätigt sehen willst. Willst du lieber bei der JSON-Datei bleiben? `ABUSEIPDB_CACHE_BACKEND=json` setzen, dann ändert sich für dich nichts.
+**Upgrade von v1.x?** v2.0.0 hat das Standard-Cache-Backend von einer einzelnen JSON-Datei auf SQLite umgestellt; v3.0.0 macht SQLite zum *einzigen* Backend (`ABUSEIPDB_CACHE_BACKEND=json` wurde komplett entfernt – siehe CHANGELOG). Liegt deine `cache.json` genau dort, wo auch `cache.db` entstehen würde (der Standardpfad), wird sie beim ersten Start nach dem Upgrade automatisch importiert und zu `cache.json.migrated` umbenannt – als Backup behalten, nie gelöscht. Du musst nichts tun; im Log steht "Migration complete", falls du's bestätigt sehen willst. Liegt deine `cache.json` stattdessen unter einem eigenen `ABUSEIPDB_CACHE_FILE`-Pfad, migrier sie explizit: `abuseipdb_proxy.py --migrate-to-sqlite /pfad/zur/alten/cache.json`.
 
 Prüft auf neue Commits in `origin/main`, bricht ab, falls du lokal uncommittete Änderungen hast, zeigt was sich ändert (inklusive dem passenden `CHANGELOG.md`-Abschnitt, falls sich die Version geändert hat), zieht dann und stößt `install.sh` für dich an. Jederzeit gefahrlos ausführbar – macht nichts, falls du eh schon aktuell bist. Mit `-y` überspringst du die Bestätigungsabfrage (z. B. für einen Cronjob).
 
@@ -154,7 +154,7 @@ Entfernt alles, was `install.sh` angelegt hat (Service, Binary, Config, Cache, C
 
 ## Docker
 
-Eine Alternative zu `install.sh`, für alle, die CrowdSec schon (oder demnächst) containerisiert betreiben. Alles Docker-Bezogene liegt in `Docker/`, getrennt von der Bare-Metal-Installation im Repo-Root. Fertige Multi-Arch-Images (`linux/amd64`, `linux/arm64` – Raspberry Pi inklusive) werden bei jedem Release nach GHCR veröffentlicht; kein lokaler Build nötig. Das Image hat keine Drittanbieter-Python-Abhängigkeiten – der Proxy ist rein Standard-Library – daher ein kleines, normales `python:3.13-alpine`-Build ohne zusätzliche Pakete; CI baut es bei jedem Push und meldet die tatsächliche Größe. Auch der Ressourcenverbrauch zur Laufzeit ist minimal: ein Single-Thread-Prozess, der gelegentliche Alerts verarbeitet, in der Praxis deutlich unter 64MB RAM (siehe die auskommentierten `mem_limit`/`cpus` in `Docker/docker-compose.yml`, falls du trotzdem eine harte Grenze willst).
+Eine Alternative zu `install.sh`, für alle, die CrowdSec schon (oder demnächst) containerisiert betreiben. Alles Docker-Bezogene liegt in `Docker/`, getrennt von der Bare-Metal-Installation im Repo-Root. Fertige Multi-Arch-Images (`linux/amd64`, `linux/arm64` – Raspberry Pi inklusive) werden bei jedem Release nach GHCR veröffentlicht; kein lokaler Build nötig. Das Image hat keine Drittanbieter-Python-Abhängigkeiten – der Proxy ist rein Standard-Library – daher ein kleines, normales `python:3.13-alpine`-Build ohne zusätzliche Pakete; CI baut es bei jedem Push und meldet die tatsächliche Größe. Auch der Ressourcenverbrauch zur Laufzeit ist minimal: in der Praxis deutlich unter 64MB RAM bei gelegentlichen Alerts (siehe die auskommentierten `mem_limit`/`cpus` in `Docker/docker-compose.yml`, falls du trotzdem eine harte Grenze willst).
 
 ```bash
 cd Docker
@@ -200,8 +200,7 @@ Jede unten aufgeführte, secret-artige Variable (API-Key, Tokens, Webhook-URLs, 
 | `ABUSEIPDB_API_KEY` | *(erforderlich)* | Dein AbuseIPDB API-Key |
 | `ABUSEIPDB_PROXY_PORT` | `9999` | Lokaler Port des Proxys |
 | `ABUSEIPDB_LISTEN_ADDRESS` | `127.0.0.1` | Interface, an das gebunden wird. Nur in einer isolierten Umgebung vom Loopback-only-Default abweichen (z. B. innerhalb der Docker-eigenen Netzwerkisolation – siehe „Docker" oben); niemals direkt einem nicht vertrauenswürdigen Netz aussetzen. |
-| `ABUSEIPDB_CACHE_FILE` | `/var/lib/abuseipdb-proxy/cache.db` (bzw. `cache.json` bei `ABUSEIPDB_CACHE_BACKEND=json`) | Pfad zur Cache-Datei |
-| `ABUSEIPDB_CACHE_BACKEND` | `sqlite` | `sqlite` (echte Datenbank – Tabellen `reports`/`pending`/`retry_queue`, WAL-Journal, skaliert gut und lässt sich direkt mit `sqlite3` abfragen) oder `json` (eine Datei, atomar neu geschrieben – einfacher von Hand zu lesen). Ein vorhandener v1.x-`cache.json` wird beim ersten Start automatisch in einen frischen SQLite-Cache übernommen; siehe „Upgrade von v1.x“ unten. |
+| `ABUSEIPDB_CACHE_FILE` | `/var/lib/abuseipdb-proxy/cache.db` | Pfad zur SQLite-Cache-Datenbank |
 | `ABUSEIPDB_SQLITE_JOURNAL_MODE` | `WAL` | SQLite-Journal-Modus. Der Standard ist bereits SSD-freundlich, selten änderungswürdig. Nur beim SQLite-Backend relevant. |
 | `ABUSEIPDB_SQLITE_SYNCHRONOUS` | `NORMAL` | SQLite-Sync-Modus. `FULL` tauscht etwas Write-Amplification gegen mehr Haltbarkeit ein, falls du auf unzuverlässigem Storage (z. B. SD-Karte) unterwegs bist. Nur beim SQLite-Backend relevant. |
 | `ABUSEIPDB_REPORT_WINDOW` | `905` | Standard-Zeitfenster in Sekunden zwischen Reports derselben IP |
@@ -289,14 +288,14 @@ Zwei zusätzliche Sicherheitsnetze, unabhängig vom eigenen Logging der App:
 | `--stats [--json] [--stats-limit N]` | Cache-Snapshot: aktuelle Reports, ausstehende Eskalationen, wartende Retries, AbuseIPDB-Kontingent. `--json` fürs Scripting; `--stats-limit` begrenzt die Recent-Reports-Liste (Standard 10). |
 | `--export [PFAD]` | Cache als portables JSON nach PFAD exportieren, oder nach stdout falls weggelassen. |
 | `--import PFAD [-y]` | Ersetzt den Cache durch einen JSON-Snapshot aus PFAD (oder `-` für stdin). Fragt nach Bestätigung, außer `-y`/`--yes`. |
-| `--vacuum` | Räumt alte Reports auf und gibt beim SQLite-Backend Speicherplatz frei. No-op bei JSON. |
+| `--vacuum` | Räumt alte Reports auf und gibt im SQLite-Cache Speicherplatz frei. |
 | `--backup [VERZ]` | Schreibt einen zeitgestempelten Cache-Snapshot nach VERZ (Standard: `backups/` neben der Cache-Datei), räumt danach alte Backups über `ABUSEIPDB_BACKUP_RETENTION` (Standard 14) hinaus auf. Passt für einen periodischen Timer. |
 | `--check-config [--json]` | Validiert die Konfiguration (API-Key, Cache-Pfad, Alarm-Backends, Timing) ohne Netzwerkzugriff und ohne Änderungen. Exit-Code 1 bei Fehlern. |
 | `--doctor [--no-network] [--json]` | Alles, was `--check-config` prüft, plus systemd-Service-Status, Dateiberechtigungen, CrowdSec-`profiles.yaml`-Verdrahtung, Cache-Lesbarkeit, ob api.abuseipdb.com erreichbar ist, und (außer bei `--no-network`) ein Live-Selbsttest – schickt einen synthetischen, immer gefilterten Test-Alert über den tatsächlich laufenden Proxy-Prozess und bestätigt, dass die deployte Instanz wirklich lauscht und funktioniert, nicht nur dass die Konfiguration dieses CLI-Aufrufs plausibel aussieht. Bare-Metal-spezifische Checks überspringen sich sauber außerhalb dieses Kontexts (z. B. in Docker). |
 | `--test-notify` | Schickt eine Testnachricht an alle konfigurierten Alarm-Backends. |
 | `--notify NACHRICHT [--notify-priority low\|normal\|high]` | Schickt eine beliebige Nachricht über die konfigurierten Alarm-Backends. Wird intern von `update.sh --check-only` genutzt. |
 | `--reconcile [--json]` | Vergleicht CrowdSecs aktuell aktive Decisions mit dem Report-Cache des Proxys und meldet fehlende (siehe „CrowdSec-Decision-Reconciliation" unten). Passt für einen periodischen Timer. |
-| `--migrate-to-sqlite [PATH]` | Einmalige Migration weg vom deprecateten `ABUSEIPDB_CACHE_BACKEND=json` (entfernt in 3.0.0): schreibt den aktuellen JSON-Cache in eine neue SQLite-Datenbank unter PATH (Default: gleicher Name mit `.db`-Endung), ohne die JSON-Datei anzufassen oder zu löschen oder die Konfiguration zu ändern. Verweigert das Überschreiben einer bereits existierenden Zieldatei. `ABUSEIPDB_CACHE_BACKEND=sqlite` musst du danach selbst setzen. |
+| `--migrate-to-sqlite SOURCE_JSON_FILE [--migrate-target PATH]` | Einmalige Migration weg vom JSON-Cache-Format, dessen Backend-Unterstützung in 3.0.0 komplett entfernt wurde: liest SOURCE_JSON_FILE (deine alte `cache.json`) und schreibt eine neue SQLite-Datenbank unter `--migrate-target` (Default: SOURCE_JSON_FILE mit `.db`-Endung), ohne die Quelldatei anzufassen oder zu löschen. Verweigert das Überschreiben einer bereits existierenden Zieldatei. |
 
 ## Endpoints
 
@@ -398,7 +397,7 @@ crowdsec-smart-abuseipdb/
 
 - Standardmäßig keine Authentifizierung auf dem lokalen Port – unkritisch, solange er nur auf `127.0.0.1` lauscht (der Docker-Default `0.0.0.0` ist unkritisch, gerade weil er innerhalb der Docker-eigenen Netzwerkisolation bleibt, siehe „Docker" oben). Für Setups, wo diese Grenze weniger klar ist, bieten `ABUSEIPDB_ALLOWED_SOURCE_IPS` und `ABUSEIPDB_SHARED_SECRET` optionale zusätzliche Schichten – siehe „Konfiguration" oben.
 - Das 15-Minuten-Standardfenster ist pro Severity-Stufe konfigurierbar (`ABUSEIPDB_REPORT_WINDOW_*`) und seit v2.5.0 auch pro Kategorie (`ABUSEIPDB_REPORT_WINDOW_CATEGORIES`) – aber weiterhin nicht pro einzelner IP.
-- Der Standard-SQLite-Cache skaliert komfortabel auch bei großer Report-Historie; das JSON-Backend (`ABUSEIPDB_CACHE_BACKEND=json`) ist **seit v2.9.0 deprecated und wird in 3.0.0 komplett entfernt**. Falls du noch darauf läufst: `abuseipdb_proxy.py --migrate-to-sqlite` ausführen und umstellen – siehe „Konfiguration" oben.
+- Der Standard-SQLite-Cache skaliert komfortabel auch bei großer Report-Historie und ist seit 3.0.0 das einzige Backend (`ABUSEIPDB_CACHE_BACKEND=json` wurde komplett entfernt – eine alte Env-Datei, die das noch setzt, bekommt nur eine laute Warnung, keinen Absturz; siehe `--migrate-to-sqlite` oben, falls du von einem eigenen `ABUSEIPDB_CACHE_FILE`-Pfad migrierst).
 
 ## Contributing
 
