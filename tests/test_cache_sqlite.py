@@ -331,3 +331,90 @@ def test_health_endpoint_uses_count_not_full_load(running_server, monkeypatch):
 
     assert calls["count"] == 1
     assert calls["load_cache"] == 0
+
+
+# --- Single-row hot-path operations & periodic stale-report sweep ----------
+
+def test_sqlite_get_report_returns_none_for_missing_ip(sqlite_proxy):
+    assert sqlite_proxy._sqlite_get_report("1.2.3.4") is None
+
+
+def test_sqlite_get_report_and_upsert_round_trip(sqlite_proxy):
+    sqlite_proxy._sqlite_upsert_report("1.2.3.4", 1000, 2)
+    assert sqlite_proxy._sqlite_get_report("1.2.3.4") == {"time": 1000, "severity": 2}
+
+
+def test_sqlite_upsert_report_overwrites_existing_row(sqlite_proxy):
+    sqlite_proxy._sqlite_upsert_report("1.2.3.4", 1000, 2)
+    sqlite_proxy._sqlite_upsert_report("1.2.3.4", 2000, 3)
+    assert sqlite_proxy._sqlite_get_report("1.2.3.4") == {"time": 2000, "severity": 3}
+
+
+def test_sqlite_upsert_pending_and_delete(sqlite_proxy):
+    sqlite_proxy._sqlite_upsert_pending("5.6.7.8", 2000, 3, "18", "x")
+    cache = sqlite_proxy.load_cache()
+    assert cache["pending"]["5.6.7.8"] == {
+        "due_time": 2000, "severity": 3, "categories": "18", "comment": "x",
+    }
+    sqlite_proxy._sqlite_delete_pending("5.6.7.8")
+    assert "5.6.7.8" not in sqlite_proxy.load_cache()["pending"]
+
+
+def test_sqlite_delete_pending_missing_ip_is_a_silent_no_op(sqlite_proxy):
+    sqlite_proxy._sqlite_delete_pending("no.such.ip.here")  # must not raise
+
+
+def test_sqlite_upsert_retry_and_delete(sqlite_proxy):
+    sqlite_proxy._sqlite_upsert_retry("1.1.1.1", 3000, "15", "y", 2)
+    cache = sqlite_proxy.load_cache()
+    assert cache["retry_queue"]["1.1.1.1"] == {
+        "due_time": 3000, "categories": "15", "comment": "y", "attempts": 2,
+    }
+    sqlite_proxy._sqlite_delete_retry("1.1.1.1")
+    assert "1.1.1.1" not in sqlite_proxy.load_cache()["retry_queue"]
+
+
+def test_stale_report_sweep_removes_only_stale_rows(sqlite_proxy):
+    now = int(sqlite_proxy.time.time())
+    sqlite_proxy.save_cache({
+        "reports": {
+            "stale.ip": {"time": now - 90_000, "severity": 1},   # > 24h old
+            "fresh.ip": {"time": now - 100, "severity": 1},      # recent
+        },
+        "pending": {}, "retry_queue": {},
+    })
+    sqlite_proxy._last_stale_report_sweep = 0.0  # force it to actually run
+
+    sqlite_proxy._maybe_sweep_stale_reports()
+
+    cache = sqlite_proxy.load_cache()
+    assert "stale.ip" not in cache["reports"]
+    assert "fresh.ip" in cache["reports"]
+
+
+def test_stale_report_sweep_only_runs_once_per_interval(sqlite_proxy):
+    now = int(sqlite_proxy.time.time())
+    sqlite_proxy.save_cache({
+        "reports": {"stale.ip": {"time": now - 90_000, "severity": 1}},
+        "pending": {}, "retry_queue": {},
+    })
+    sqlite_proxy._last_stale_report_sweep = sqlite_proxy.time.time()  # "just ran"
+
+    sqlite_proxy._maybe_sweep_stale_reports()
+
+    # the sweep was skipped (still within the interval) — the stale row
+    # is still there
+    assert "stale.ip" in sqlite_proxy.load_cache()["reports"]
+
+
+def test_process_alert_triggers_the_sweep_and_respects_its_interval(proxy, deferred_thread):
+    now = int(proxy.time.time())
+    proxy.save_cache({
+        "reports": {"stale.ip": {"time": now - 90_000, "severity": 1}},
+        "pending": {}, "retry_queue": {},
+    })
+    proxy._last_stale_report_sweep = 0.0
+
+    proxy.process_alert("1.2.3.4", "15", "test", new_severity=1)
+
+    assert "stale.ip" not in proxy.load_cache()["reports"]

@@ -100,7 +100,7 @@ def test_second_escalation_at_or_below_pending_severity_is_suppressed(proxy, fak
     assert proxy.pending_timers["1.2.3.4"]["severity"] == 3  # unchanged
 
 
-def test_reports_older_than_24h_are_pruned_and_treated_as_new(proxy, deferred_thread):
+def test_reports_older_than_24h_are_treated_as_new(proxy, deferred_thread):
     proxy.save_cache({
         "reports": {"1.2.3.4": {"time": int(time.time()) - 90_000, "severity": 3}},  # > 24h old
         "pending": {},
@@ -111,3 +111,27 @@ def test_reports_older_than_24h_are_pruned_and_treated_as_new(proxy, deferred_th
 
     cache = proxy.load_cache()
     assert cache["reports"]["1.2.3.4"]["severity"] == 1  # fresh report, not an "escalation"
+
+
+def test_stale_entry_for_another_ip_is_not_eagerly_removed(proxy, deferred_thread):
+    # Regression test for the hot-path rewrite: process_alert() used to
+    # read/rewrite the *entire* reports table on every call (an O(n) cost
+    # per alert), which incidentally deleted every stale row it happened
+    # to pass over. It now only ever touches the one ip it was called
+    # for — a stale row for a *different* ip must be left alone (it's
+    # --vacuum's/the periodic sweep's job to clean those up, not every
+    # unrelated alert's). Sweep is pinned to "just ran" so this test
+    # isolates process_alert()'s own behavior from the separate periodic
+    # sweep (covered by its own tests in test_cache_sqlite.py).
+    proxy._last_stale_report_sweep = proxy.time.time()
+    stale_time = int(proxy.time.time()) - 90_000  # > 24h old
+    proxy.save_cache({
+        "reports": {"9.9.9.9": {"time": stale_time, "severity": 2}},
+        "pending": {}, "retry_queue": {},
+    })
+
+    proxy.process_alert("1.2.3.4", "14", "port scan", new_severity=1)
+
+    cache = proxy.load_cache()
+    assert "9.9.9.9" in cache["reports"]
+    assert cache["reports"]["9.9.9.9"]["time"] == stale_time  # untouched
