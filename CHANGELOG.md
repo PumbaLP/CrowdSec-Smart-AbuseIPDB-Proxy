@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## [3.0.2] - Hot-path rewritten to single-row cache operations
+
+No breaking changes, but a real behavioral change worth knowing about (see below). Follow-up to the "investigated, not changed" note in 3.0.1.
+
+### Changed
+- **`process_alert()`, `_schedule_pending()`, `_finalize_pending()`, and `send_with_retry()` no longer read or write the entire cache on every alert.** They used to call `load_cache()`/`save_cache()` — a full read (or DELETE-all-then-reinsert-all write) of every row in every table — for every single incoming alert, meaning the true cost of processing "one new report" scaled with the *total* number of tracked IPs, not with the one alert actually being handled. New single-row operations (`_sqlite_get_report()`, `_sqlite_upsert_report()`, and equivalents for `pending`/`retry_queue`) touch only the one row a given alert actually needs. Measured directly: 11.5ms → 2.3ms per alert against a 5,000-entry cache (~5x), and — the more important number — 1.8ms per alert against a 50,000-entry cache, essentially unchanged from the 5,000-entry case. The old approach scaled linearly with cache size; this doesn't scale with it at all. `load_cache()`/`save_cache()` themselves are unchanged and still used exactly as before everywhere else (`--backup`, `--reconcile`, `--vacuum`, `--import`/`--export`, `--migrate-to-sqlite`, startup resume) — none of those run on the request hot path, so there was nothing to gain by touching them.
+- **Behavioral change**: reports older than 24h used to be pruned from the database as an inline side effect of *every* alert (whichever alert happened to trigger the read-modify-write of the whole table). That's gone — an individual alert's dedup decision only ever depended on its own row, never on whether unrelated stale rows had been cleaned up, so nothing about correctness required doing this eagerly. In its place: a new `_maybe_sweep_stale_reports()` runs a single lightweight `DELETE FROM reports WHERE time <= ?` (not a Python-side read of every row) at most once an hour, keeping the table from growing unboundedly between `--vacuum` runs for anyone who hasn't set up the vacuum timer, without paying that cost on literally every alert.
+
+### Added
+- 12 new tests: `test_cache_sqlite.py` covers the new single-row operations and the periodic sweep directly (including that it only runs once per hour, not every call); `test_dedup_escalation.py` adds a regression test confirming a stale row for a *different* IP is left alone by an unrelated alert (the specific behavior that would have silently broken if the rewrite had gotten the row-scoping wrong). Full suite re-run 15x in a row against the concurrency/dedup/retry/cache tests specifically (this touches the same locking as the `ThreadingHTTPServer` work) with no flakiness.
+
 ## [3.0.1] - Full audit pass: bugs, logic errors, performance
 
 A deliberate full read-through of the entire codebase (not tied to a specific feature), looking for real bugs and performance issues rather than adding anything new. No breaking changes.

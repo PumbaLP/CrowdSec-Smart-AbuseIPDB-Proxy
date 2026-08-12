@@ -29,7 +29,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 
-VERSION = "3.0.1"
+VERSION = "3.0.2"
 
 START_TIME = time.time()
 
@@ -965,6 +965,116 @@ def _save_cache_sqlite(cache, path=None):
         conn.close()
 
 
+# --- Single-row operations for the hot alert-processing path ---------------
+# load_cache()/save_cache() above round-trip the *entire* cache and are the
+# right tool for bulk operations (startup resume, --backup, --reconcile,
+# --vacuum, --import/--export, migration) — but process_alert() used to call
+# them on every single incoming alert, meaning one new report turned into
+# reading and rewriting every row in every table, every time. These do just
+# the one row a given alert actually touches. See CHANGELOG.md for the
+# benchmark that motivated this (the first attempt — swapping the *bulk*
+# DELETE+INSERT for a *bulk* UPSERT — didn't actually help, since the
+# per-alert cost was in touching every row at all, not in which SQL
+# statement did it).
+
+def _sqlite_get_report(ip, path=None):
+    conn = _sqlite_connect(path)
+    try:
+        row = conn.execute("SELECT time, severity FROM reports WHERE ip = ?", (ip,)).fetchone()
+        return {"time": row[0], "severity": row[1]} if row else None
+    finally:
+        conn.close()
+
+
+def _sqlite_upsert_report(ip, time_val, severity, path=None):
+    conn = _sqlite_connect(path)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO reports (ip, time, severity) VALUES (?, ?, ?) "
+                "ON CONFLICT(ip) DO UPDATE SET time = excluded.time, severity = excluded.severity",
+                (ip, time_val, severity),
+            )
+    finally:
+        conn.close()
+
+
+def _sqlite_upsert_pending(ip, due_time, severity, categories, comment, path=None):
+    conn = _sqlite_connect(path)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO pending (ip, due_time, severity, categories, comment) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(ip) DO UPDATE SET due_time = excluded.due_time, severity = excluded.severity, "
+                "categories = excluded.categories, comment = excluded.comment",
+                (ip, due_time, severity, categories, comment),
+            )
+    finally:
+        conn.close()
+
+
+def _sqlite_delete_pending(ip, path=None):
+    conn = _sqlite_connect(path)
+    try:
+        with conn:
+            conn.execute("DELETE FROM pending WHERE ip = ?", (ip,))
+    finally:
+        conn.close()
+
+
+def _sqlite_upsert_retry(ip, due_time, categories, comment, attempts, path=None):
+    conn = _sqlite_connect(path)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO retry_queue (ip, due_time, categories, comment, attempts) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(ip) DO UPDATE SET due_time = excluded.due_time, categories = excluded.categories, "
+                "comment = excluded.comment, attempts = excluded.attempts",
+                (ip, due_time, categories, comment, attempts),
+            )
+    finally:
+        conn.close()
+
+
+def _sqlite_delete_retry(ip, path=None):
+    conn = _sqlite_connect(path)
+    try:
+        with conn:
+            conn.execute("DELETE FROM retry_queue WHERE ip = ?", (ip,))
+    finally:
+        conn.close()
+
+
+_last_stale_report_sweep = 0.0
+_STALE_REPORT_SWEEP_INTERVAL = 3600  # 1 hour
+_STALE_REPORT_AGE = 86400  # 24h — same window process_alert()/vacuum_cache() already used
+
+
+def _maybe_sweep_stale_reports():
+    """A single SQL DELETE (not a Python-side read of every row) pruning
+    reports older than 24h, run at most once an hour. process_alert() used
+    to do the equivalent of this on *every single alert* by reading the
+    whole reports table into Python, filtering it, and rewriting it —
+    correct, but it meant the cost of "how many reports have ever been
+    tracked" was paid on every new alert regardless. A single ip's dedup
+    decision only ever depends on that ip's own row, so nothing about
+    correctness requires doing this eagerly on every call; --vacuum already
+    exists for exactly this maintenance and can still be run explicitly any
+    time. This just keeps the table from growing unboundedly between vacuum
+    runs for anyone who hasn't set up the vacuum timer."""
+    global _last_stale_report_sweep
+    now = time.time()
+    if now - _last_stale_report_sweep < _STALE_REPORT_SWEEP_INTERVAL:
+        return
+    _last_stale_report_sweep = now
+    conn = _sqlite_connect()
+    try:
+        with conn:
+            conn.execute("DELETE FROM reports WHERE time <= ?", (int(now) - _STALE_REPORT_AGE,))
+    finally:
+        conn.close()
+
+
 # AbuseIPDB returns X-RateLimit-Limit / X-RateLimit-Remaining on every
 # report response (success or error), and resets at 00:00 UTC. Tracked
 # here so it's visible via /health and /metrics without needing a
@@ -1288,9 +1398,7 @@ def send_with_retry(ip, categories, comment, attempt=1):
             log(f"Reported {ip} to AbuseIPDB (categories={categories}).", ip=ip, categories=categories)
         inc_metric("reports_sent_total")
         with lock:
-            cache = load_cache()
-            cache["retry_queue"].pop(ip, None)
-            save_cache(cache)
+            _sqlite_delete_retry(ip)
         retry_timers.pop(ip, None)
         return
 
@@ -1300,9 +1408,7 @@ def send_with_retry(ip, categories, comment, attempt=1):
         inc_metric("reports_failed_total")
         notify(f"Gave up reporting {ip} to AbuseIPDB after {attempt} failed attempt(s). Check the logs for details.", priority="high")
         with lock:
-            cache = load_cache()
-            cache["retry_queue"].pop(ip, None)
-            save_cache(cache)
+            _sqlite_delete_retry(ip)
         retry_timers.pop(ip, None)
         return
 
@@ -1317,14 +1423,7 @@ def send_with_retry(ip, categories, comment, attempt=1):
         attempt=attempt + 1, max_retries=MAX_RETRIES,
     )
     with lock:
-        cache = load_cache()
-        cache["retry_queue"][ip] = {
-            "due_time": now + delay,
-            "categories": categories,
-            "comment": comment,
-            "attempts": attempt,
-        }
-        save_cache(cache)
+        _sqlite_upsert_retry(ip, now + delay, categories, comment, attempt)
 
     timer = threading.Timer(delay, send_with_retry, args=(ip, categories, comment, attempt + 1))
     timer.daemon = True
@@ -1340,20 +1439,17 @@ def _finalize_pending(ip, categories, comment, new_severity):
     fires, potentially minutes or hours later."""
     t_now = int(time.time())
     with lock:
-        cache = load_cache()
         pending_timers.pop(ip, None)
         if quota_reserved_for(new_severity):
-            cache["pending"].pop(ip, None)
-            save_cache(cache)
+            _sqlite_delete_pending(ip)
             inc_metric("reports_quota_reserved_total")
             if VERBOSE_LOGGING:
                 log(f"Dropping due escalation for {ip} (severity {new_severity}): "
                     f"daily quota reserved for a higher severity tier.",
                     ip=ip, severity=new_severity)
             return
-        cache["reports"][ip] = {"time": t_now, "severity": new_severity}
-        cache["pending"].pop(ip, None)
-        save_cache(cache)
+        _sqlite_upsert_report(ip, t_now, new_severity)
+        _sqlite_delete_pending(ip)
     threading.Thread(target=send_with_retry, args=(ip, categories, comment), daemon=True).start()
 
 
@@ -1370,38 +1466,39 @@ def _schedule_pending(ip, categories, comment, new_severity, delay):
         timer.start()
 
         now = int(time.time())
-        cache = load_cache()
-        cache["pending"][ip] = {
-            "due_time": now + delay,
-            "severity": new_severity,
-            "categories": categories,
-            "comment": comment,
-        }
-        save_cache(cache)
+        _sqlite_upsert_pending(ip, now + delay, new_severity, categories, comment)
 
 
 def process_alert(ip, categories, comment, new_severity):
     """Returns the background Thread actually sending the report, if one
     was started (None if suppressed/reserved/pending/deduped) — most
     callers (the live HTTP path) fire-and-forget and ignore this; --reconcile
-    uses it to wait for its batch of catch-up sends before the process exits."""
+    uses it to wait for its batch of catch-up sends before the process exits.
+
+    Reads/writes only the one row this ip actually needs (see the
+    single-row operations above _sqlite_get_report()) rather than the
+    whole reports table — this used to load_cache()/save_cache() the
+    entire cache on every single call, which meant the true cost was
+    proportional to the total number of tracked IPs, not to "one new
+    alert." _maybe_sweep_stale_reports() replaces the inline full-table
+    prune that used to happen here on every call."""
     now = int(time.time())
     with lock:
-        cache = load_cache()
-        cache["reports"] = {
-            k: v for k, v in cache["reports"].items() if v.get("time", 0) > now - 86400
-        }
-
-        entry = cache["reports"].get(ip)
+        _maybe_sweep_stale_reports()
+        entry = _sqlite_get_report(ip)
+        if entry and entry.get("time", 0) <= now - 86400:
+            entry = None  # stale — treated the same as "no entry"; the row
+                           # itself lingers until the next sweep/--vacuum,
+                           # which doesn't affect this (or any other) ip's
+                           # dedup decision
 
         if not entry:
             if ip in pending_timers:
                 pending_timers[ip]["timer"].cancel()
                 del pending_timers[ip]
-                cache["pending"].pop(ip, None)
+                _sqlite_delete_pending(ip)
 
             if quota_reserved_for(new_severity):
-                save_cache(cache)  # persist the pruned "reports" map either way
                 inc_metric("reports_quota_reserved_total")
                 if VERBOSE_LOGGING:
                     log(f"Holding back report for {ip} (severity {new_severity}): "
@@ -1409,8 +1506,7 @@ def process_alert(ip, categories, comment, new_severity):
                         ip=ip, severity=new_severity)
                 return
 
-            cache["reports"][ip] = {"time": now, "severity": new_severity}
-            save_cache(cache)
+            _sqlite_upsert_report(ip, now, new_severity)
             t = threading.Thread(target=send_with_retry, args=(ip, categories, comment), daemon=True)
             t.start()
             return t
@@ -1427,26 +1523,23 @@ def process_alert(ip, categories, comment, new_severity):
                 if pending:
                     pending["timer"].cancel()
                     del pending_timers[ip]
-                    cache["pending"].pop(ip, None)
+                    _sqlite_delete_pending(ip)
 
                 window = get_report_window(new_severity, categories)
                 if time_passed >= window:
                     if quota_reserved_for(new_severity):
-                        save_cache(cache)
                         inc_metric("reports_quota_reserved_total")
                         if VERBOSE_LOGGING:
                             log(f"Holding back escalation for {ip} (severity {new_severity}): "
                                 f"daily quota reserved for a higher severity tier.",
                                 ip=ip, severity=new_severity)
                         return
-                    cache["reports"][ip] = {"time": now, "severity": new_severity}
-                    save_cache(cache)
+                    _sqlite_upsert_report(ip, now, new_severity)
                     t = threading.Thread(target=send_with_retry, args=(ip, categories, comment), daemon=True)
                     t.start()
                     return t
                 else:
                     delay = window - time_passed
-                    save_cache(cache)  # persist the pruned "reports" map first
                     _schedule_pending(ip, categories, comment, new_severity, delay)
             else:
                 inc_metric("reports_suppressed_total")  # escalation already pending at >= this severity
