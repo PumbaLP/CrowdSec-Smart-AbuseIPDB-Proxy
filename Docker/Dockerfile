@@ -7,7 +7,7 @@
 # "docker" CI job in .github/workflows/ci.yml on every push, since this
 # specific point has bitten people with *other*, non-official Alpine
 # Python builds before).
-FROM python:3.13-alpine
+FROM python:3.14-alpine
 
 LABEL org.opencontainers.image.source="https://github.com/PumbaLP/CrowdSec-Smart-AbuseIPDB-Proxy" \
       org.opencontainers.image.description="Deduplicating, rate-limit-aware proxy from CrowdSec alerts to AbuseIPDB" \
