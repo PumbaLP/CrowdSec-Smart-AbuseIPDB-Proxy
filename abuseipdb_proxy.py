@@ -29,7 +29,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 
-VERSION = "3.0.2"
+VERSION = "3.0.3"
 
 START_TIME = time.time()
 
@@ -999,6 +999,15 @@ def _sqlite_upsert_report(ip, time_val, severity, path=None):
         conn.close()
 
 
+def _sqlite_delete_report(ip, path=None):
+    conn = _sqlite_connect(path)
+    try:
+        with conn:
+            conn.execute("DELETE FROM reports WHERE ip = ?", (ip,))
+    finally:
+        conn.close()
+
+
 def _sqlite_upsert_pending(ip, due_time, severity, categories, comment, path=None):
     conn = _sqlite_connect(path)
     try:
@@ -1102,6 +1111,13 @@ QUOTA_STATE_FILE = CACHE_FILE + ".quota.json"
 # starts as None) — it never blocks anything based on a guess.
 QUOTA_RESERVE_MEDIUM = int(os.getenv("ABUSEIPDB_QUOTA_RESERVE_MEDIUM", "0"))
 QUOTA_RESERVE_HIGH = int(os.getenv("ABUSEIPDB_QUOTA_RESERVE_HIGH", "0"))
+
+# How long (seconds) to wait before re-checking a report that was held
+# back because the daily quota was reserved for a higher severity tier.
+# Without this, a held-back report used to be silently dropped for good
+# once the quota reservation kicked in -- now it's rescheduled to check
+# again later instead of vanishing.
+QUOTA_RESERVE_RECHECK_DELAY = int(os.getenv("ABUSEIPDB_QUOTA_RESERVE_RECHECK_DELAY", "300"))
 
 
 def quota_reserved_for(severity):
@@ -1384,12 +1400,16 @@ def send_report_api(ip, categories, comment):
     return success, retry_after
 
 
-def send_with_retry(ip, categories, comment, attempt=1):
+def send_with_retry(ip, categories, comment, attempt=1, report_time=None):
     """
     Sends a report, retrying on failure (network errors, 5xx, or 429) up to
     MAX_RETRIES times. Retries are persisted to the cache's "retry_queue"
     so they survive a proxy restart. Does NOT touch the "reports" dedup
-    entry — that's written optimistically by the caller before this runs.
+    entry on a normal call — that's written optimistically by the caller
+    before this runs. If every retry is exhausted, though, it DOES remove
+    that "reports" entry (guarded by report_time, see below) so the IP
+    isn't left permanently marked as "already reported" with no report
+    having actually succeeded.
     """
     success, retry_after = send_report_api(ip, categories, comment)
 
@@ -1409,6 +1429,15 @@ def send_with_retry(ip, categories, comment, attempt=1):
         notify(f"Gave up reporting {ip} to AbuseIPDB after {attempt} failed attempt(s). Check the logs for details.", priority="high")
         with lock:
             _sqlite_delete_retry(ip)
+            if report_time is not None:
+                current = _sqlite_get_report(ip)
+                # Only clear the "reports" entry if it's still the same one
+                # this call was trying to deliver. A fresher entry (written
+                # by a newer escalation that came in while we were retrying)
+                # must survive -- otherwise we'd wipe out a legitimately
+                # up-to-date dedup record.
+                if current is not None and current.get("time") == report_time:
+                    _sqlite_delete_report(ip)
         retry_timers.pop(ip, None)
         return
 
@@ -1423,9 +1452,9 @@ def send_with_retry(ip, categories, comment, attempt=1):
         attempt=attempt + 1, max_retries=MAX_RETRIES,
     )
     with lock:
-        _sqlite_upsert_retry(ip, now + delay, categories, comment, attempt)
+        _sqlite_upsert_retry(ip, now + delay, categories, comment, attempt + 1)
 
-    timer = threading.Timer(delay, send_with_retry, args=(ip, categories, comment, attempt + 1))
+    timer = threading.Timer(delay, send_with_retry, args=(ip, categories, comment, attempt + 1, report_time))
     timer.daemon = True
     retry_timers[ip] = timer
     timer.start()
@@ -1441,16 +1470,31 @@ def _finalize_pending(ip, categories, comment, new_severity):
     with lock:
         pending_timers.pop(ip, None)
         if quota_reserved_for(new_severity):
-            _sqlite_delete_pending(ip)
             inc_metric("reports_quota_reserved_total")
             if VERBOSE_LOGGING:
-                log(f"Dropping due escalation for {ip} (severity {new_severity}): "
-                    f"daily quota reserved for a higher severity tier.",
+                log(f"Deferring due escalation for {ip} (severity {new_severity}): "
+                    f"daily quota reserved for a higher severity tier, will re-check "
+                    f"in {QUOTA_RESERVE_RECHECK_DELAY}s.",
                     ip=ip, severity=new_severity)
+            _schedule_pending(ip, categories, comment, new_severity, QUOTA_RESERVE_RECHECK_DELAY)
             return
+        _cancel_active_retry_chain(ip)
         _sqlite_upsert_report(ip, t_now, new_severity)
         _sqlite_delete_pending(ip)
-    threading.Thread(target=send_with_retry, args=(ip, categories, comment), daemon=True).start()
+    threading.Thread(target=send_with_retry, args=(ip, categories, comment, 1, t_now), daemon=True).start()
+
+
+def _cancel_active_retry_chain(ip):
+    """Cancels and clears any in-flight retry chain for this ip before a
+    new send_with_retry() thread is started for it. Without this, two
+    concurrent chains for the same ip (e.g. an initial report still
+    retrying, plus a fresh escalation) can both persist to the same
+    single-row retry_queue entry and step on each other's writes. Must be
+    called while already holding `lock`."""
+    timer = retry_timers.pop(ip, None)
+    if timer is not None:
+        timer.cancel()
+    _sqlite_delete_retry(ip)
 
 
 def _schedule_pending(ip, categories, comment, new_severity, delay):
@@ -1493,21 +1537,39 @@ def process_alert(ip, categories, comment, new_severity):
                            # dedup decision
 
         if not entry:
-            if ip in pending_timers:
-                pending_timers[ip]["timer"].cancel()
+            # A pending timer can exist here even with no "reports" entry:
+            # a quota-reserve re-check (see below) schedules itself via
+            # _schedule_pending() same as an escalation would, and that
+            # pending entry has no corresponding "reports" row yet. So a
+            # new, lower-severity alert must not blindly evict an already
+            # -waiting higher-severity quota re-check -- same precedence
+            # rule as the escalation branch below (new_severity vs.
+            # pending_sev), not an unconditional cancel.
+            pending = pending_timers.get(ip)
+            pending_sev = pending["severity"] if pending else 0
+
+            if pending and new_severity <= pending_sev:
+                inc_metric("reports_suppressed_total")  # a wait at >= this severity is already pending
+                return
+
+            if pending:
+                pending["timer"].cancel()
                 del pending_timers[ip]
                 _sqlite_delete_pending(ip)
 
             if quota_reserved_for(new_severity):
                 inc_metric("reports_quota_reserved_total")
                 if VERBOSE_LOGGING:
-                    log(f"Holding back report for {ip} (severity {new_severity}): "
-                        f"daily quota reserved for a higher severity tier.",
+                    log(f"Deferring report for {ip} (severity {new_severity}): "
+                        f"daily quota reserved for a higher severity tier, will re-check "
+                        f"in {QUOTA_RESERVE_RECHECK_DELAY}s.",
                         ip=ip, severity=new_severity)
+                _schedule_pending(ip, categories, comment, new_severity, QUOTA_RESERVE_RECHECK_DELAY)
                 return
 
+            _cancel_active_retry_chain(ip)
             _sqlite_upsert_report(ip, now, new_severity)
-            t = threading.Thread(target=send_with_retry, args=(ip, categories, comment), daemon=True)
+            t = threading.Thread(target=send_with_retry, args=(ip, categories, comment, 1, now), daemon=True)
             t.start()
             return t
 
@@ -1530,12 +1592,15 @@ def process_alert(ip, categories, comment, new_severity):
                     if quota_reserved_for(new_severity):
                         inc_metric("reports_quota_reserved_total")
                         if VERBOSE_LOGGING:
-                            log(f"Holding back escalation for {ip} (severity {new_severity}): "
-                                f"daily quota reserved for a higher severity tier.",
+                            log(f"Deferring escalation for {ip} (severity {new_severity}): "
+                                f"daily quota reserved for a higher severity tier, will re-check "
+                                f"in {QUOTA_RESERVE_RECHECK_DELAY}s.",
                                 ip=ip, severity=new_severity)
+                        _schedule_pending(ip, categories, comment, new_severity, QUOTA_RESERVE_RECHECK_DELAY)
                         return
+                    _cancel_active_retry_chain(ip)
                     _sqlite_upsert_report(ip, now, new_severity)
-                    t = threading.Thread(target=send_with_retry, args=(ip, categories, comment), daemon=True)
+                    t = threading.Thread(target=send_with_retry, args=(ip, categories, comment, 1, now), daemon=True)
                     t.start()
                     return t
                 else:
@@ -1547,6 +1612,47 @@ def process_alert(ip, categories, comment, new_severity):
             inc_metric("reports_suppressed_total")  # same or lower severity within the window
 
 
+def _arm_pending_timer(ip, info):
+    """Creates, registers, and starts a threading.Timer for a persisted
+    "pending" row. Shared by resume_state_from_cache() (once at startup)
+    and _reap_orphaned_timers() (periodically, for rows written after
+    startup by another process, e.g. --reconcile) so there's exactly one
+    place that knows how to turn a "pending" row back into a live timer
+    -- the report_time bug this file's CHANGELOG documents came from
+    exactly this kind of logic existing twice and drifting apart. Caller
+    must hold `lock`."""
+    now = int(time.time())
+    delay = max(0, info.get("due_time", now) - now)
+    timer = threading.Timer(
+        delay, _finalize_pending,
+        args=(ip, info.get("categories", "15"), info.get("comment", "CrowdSec Alert"), info.get("severity", 1))
+    )
+    timer.daemon = True
+    pending_timers[ip] = {"timer": timer, "severity": info.get("severity", 1)}
+    timer.start()
+
+
+def _arm_retry_timer(ip, info, report_time):
+    """Creates, registers, and starts a threading.Timer for a persisted
+    "retry_queue" row. `report_time` must be the matching "reports" row's
+    timestamp (or None if there isn't one) -- a retry chain in progress
+    always corresponds to the "reports" row it was started with (see
+    send_with_retry()'s give-up guard); passing the wrong value here
+    silently reintroduces the "permanently marked as reported" bug. See
+    _arm_pending_timer() above for why this is factored out rather than
+    duplicated per caller. Caller must hold `lock`."""
+    now = int(time.time())
+    delay = max(0, info.get("due_time", now) - now)
+    attempt = info.get("attempts", 1)
+    timer = threading.Timer(
+        delay, send_with_retry,
+        args=(ip, info.get("categories", "15"), info.get("comment", "CrowdSec Alert"), attempt, report_time)
+    )
+    timer.daemon = True
+    retry_timers[ip] = timer
+    timer.start()
+
+
 def resume_state_from_cache():
     """Called once at startup. Re-arms any delayed escalation reports and
     any queued retries that were still outstanding when the proxy was last
@@ -1556,36 +1662,105 @@ def resume_state_from_cache():
         cache = load_cache()
         pending = cache.get("pending", {})
         retry_queue = cache.get("retry_queue", {})
+        reports = cache.get("reports", {})
 
         resumed_pending = 0
         for ip, info in list(pending.items()):
-            delay = max(0, info.get("due_time", now) - now)
-            timer = threading.Timer(
-                delay, _finalize_pending,
-                args=(ip, info.get("categories", "15"), info.get("comment", "CrowdSec Alert"), info.get("severity", 1))
-            )
-            timer.daemon = True
-            pending_timers[ip] = {"timer": timer, "severity": info.get("severity", 1)}
-            timer.start()
+            _arm_pending_timer(ip, info)
             resumed_pending += 1
 
         resumed_retries = 0
         for ip, info in list(retry_queue.items()):
-            delay = max(0, info.get("due_time", now) - now)
-            attempt = info.get("attempts", 1)
-            timer = threading.Timer(
-                delay, send_with_retry,
-                args=(ip, info.get("categories", "15"), info.get("comment", "CrowdSec Alert"), attempt)
-            )
-            timer.daemon = True
-            retry_timers[ip] = timer
-            timer.start()
+            report_time = reports.get(ip, {}).get("time")
+            _arm_retry_timer(ip, info, report_time)
             resumed_retries += 1
 
         if resumed_pending:
             log(f"Resumed {resumed_pending} pending escalation report(s) from cache.", pending_count=resumed_pending)
         if resumed_retries:
             log(f"Resumed {resumed_retries} queued retry/retries from cache.", retry_count=resumed_retries)
+
+
+# --- Periodic reconciliation between persisted state and live timers -------
+# A "pending"/"retry_queue" row can be written by a process other than
+# this long-running one -- most notably --reconcile, a short-lived CLI
+# invocation whose own send_with_retry()/​_schedule_pending() calls
+# persist a row to the shared cache exactly like a live alert would, but
+# whose in-memory threading.Timer for it dies the instant that process
+# exits (right after run_reconcile() returns), taking the retry/pending
+# with it. Without this, such a row just sits in the database forever --
+# or until an unrelated future alert for the same ip happens to touch it
+# -- never actually escalated or retried, even though nothing about the
+# data itself was lost. resume_state_from_cache() already solves this at
+# startup; this repeats the same reconciliation periodically so it also
+# catches rows written after startup, not just ones already there when
+# the service came up. Sweeping the SAME startup logic instead of relying
+# on the process happening to restart is a real fix for --reconcile's
+# "the retry gets lost" gap; the alternative (blocking --reconcile until
+# every resulting retry chain fully resolves) would defeat the point of
+# it being a periodic, bounded-runtime job. Set to 0 to disable.
+ORPHAN_RESCAN_INTERVAL = int(os.getenv("ABUSEIPDB_ORPHAN_RESCAN_INTERVAL", "60"))
+
+
+def _reap_orphaned_timers():
+    """Re-arms any persisted pending/retry row that has no matching live
+    timer in this process. A row that already has one (the overwhelmingly
+    common case -- almost everything in these tables was written by, and
+    already has a timer in, this same process) is left completely alone:
+    no cancel/restart, just skipped. Reads only the small pending/
+    retry_queue tables directly (not the potentially much larger reports
+    table via load_cache()) so this stays cheap to run frequently; a
+    report_time lookup for an orphaned retry is a targeted single-row
+    query, done only for the rows that actually turn out to need arming."""
+    now = int(time.time())
+    with lock:
+        conn = _sqlite_connect()
+        try:
+            pending_rows = {
+                ip: {"due_time": due, "severity": sev, "categories": cats, "comment": comment}
+                for ip, due, sev, cats, comment in
+                conn.execute("SELECT ip, due_time, severity, categories, comment FROM pending")
+            }
+            retry_rows = {
+                ip: {"due_time": due, "categories": cats, "comment": comment, "attempts": attempts}
+                for ip, due, cats, comment, attempts in
+                conn.execute("SELECT ip, due_time, categories, comment, attempts FROM retry_queue")
+            }
+        finally:
+            conn.close()
+
+        reaped_pending = 0
+        for ip, info in pending_rows.items():
+            if ip in pending_timers:
+                continue
+            _arm_pending_timer(ip, info)
+            reaped_pending += 1
+
+        reaped_retries = 0
+        for ip, info in retry_rows.items():
+            if ip in retry_timers:
+                continue
+            report_entry = _sqlite_get_report(ip)
+            report_time = report_entry.get("time") if report_entry else None
+            _arm_retry_timer(ip, info, report_time)
+            reaped_retries += 1
+
+    if reaped_pending or reaped_retries:
+        log(
+            f"Re-armed {reaped_pending} orphaned pending escalation(s) and "
+            f"{reaped_retries} orphaned retry/retries found in the cache with no "
+            f"live timer in this process (likely written by --reconcile).",
+            level="info", reaped_pending=reaped_pending, reaped_retries=reaped_retries,
+        )
+
+
+def _orphan_rescan_loop():
+    while True:
+        time.sleep(ORPHAN_RESCAN_INTERVAL)
+        try:
+            _reap_orphaned_timers()
+        except Exception as e:
+            log(f"Orphaned pending/retry rescan failed: {e}", level="warning")
 
 
 class AbuseIPDBHandler(http.server.BaseHTTPRequestHandler):
@@ -2915,6 +3090,8 @@ if __name__ == "__main__":
     resume_state_from_cache()
     if SUMMARY_INTERVAL > 0:
         threading.Thread(target=_summary_loop, daemon=True).start()
+    if ORPHAN_RESCAN_INTERVAL > 0:
+        threading.Thread(target=_orphan_rescan_loop, daemon=True).start()
     if NOTIFY_ON_START:
         mode = "dry-run" if DRY_RUN else "live"
         notify(f"Started ({mode} mode).", priority="low")
