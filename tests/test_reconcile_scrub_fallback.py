@@ -371,3 +371,63 @@ def test_fetch_crowdsec_active_decisions_handles_null_response(make_proxy, monke
     monkeypatch.setattr(p.urllib.request, "urlopen", lambda req, timeout=15: FakeResponse())
 
     assert p.fetch_crowdsec_active_decisions() == []
+
+
+def test_reconcile_orphaned_retry_gets_reaped_by_a_separately_running_process(
+    make_proxy, monkeypatch, fake_timer
+):
+    """
+    Full simulation of the real --reconcile gap this is meant to close:
+    --reconcile runs as its own short-lived process. If the report it
+    triggers fails and needs a retry, that retry's threading.Timer lives
+    only in the CLI process's memory and is lost the instant it exits --
+    but it also writes to the same on-disk cache the long-running service
+    reads. Modeled here as two separate `p` instances sharing one
+    tmp_path cache file: `p_reconcile` stands in for the CLI invocation
+    (its retry_timers are simply thrown away, exactly like process exit
+    would), `p_service` stands in for the always-running proxy, whose
+    periodic _reap_orphaned_timers() must pick the orphaned row back up.
+    """
+    p_reconcile = make_proxy(ABUSEIPDB_CROWDSEC_BOUNCER_KEY="test-bouncer-key")
+    p_reconcile.fetch_crowdsec_active_decisions = lambda: [("9.9.9.9", "crowdsecurity/ssh-bf")]
+    p_reconcile.send_report_api = lambda ip, cats, comment: (False, None)  # first attempt fails
+
+    p_reconcile.run_reconcile()
+    # The CLI process's own retry chain exists in ITS memory...
+    assert "9.9.9.9" in p_reconcile.retry_timers
+    # ...but the retry_queue row (and the optimistic "reports" row) is on
+    # disk, visible to anything else pointed at the same cache file.
+    assert "9.9.9.9" in p_reconcile.load_cache()["retry_queue"]
+    assert "9.9.9.9" in p_reconcile.load_cache()["reports"]
+
+    # The CLI process exits: its daemon timer is gone, with nothing left
+    # to ever fire it. (Not calling .cancel() -- an exiting process
+    # doesn't get the chance to either; the point is nothing further
+    # happens because the object is simply never reached again.)
+
+    # A second, independently-running proxy process, pointed at the same
+    # cache file, has no idea this retry exists yet.
+    p_service = make_proxy(
+        ABUSEIPDB_CACHE_FILE=p_reconcile.CACHE_FILE,
+        ABUSEIPDB_CROWDSEC_BOUNCER_KEY="test-bouncer-key",
+    )
+    assert "9.9.9.9" not in p_service.retry_timers
+    fake_timer.instances.clear()  # discard p_reconcile's now-orphaned timer object
+
+    p_service._reap_orphaned_timers()
+
+    # Now it does -- re-armed with a real, live timer in the
+    # long-running process, recovering the correct report_time too.
+    assert "9.9.9.9" in p_service.retry_timers
+    assert len(fake_timer.instances) == 1
+
+    # And it behaves exactly like a normal retry chain from here: if it
+    # goes on to exhaust its retries, the "reports" row still gets
+    # cleared correctly, not left permanently blocking future alerts.
+    monkeypatch.setattr(p_service, "send_report_api", lambda ip, cats, comment: (False, None))
+    for _ in range(p_service.MAX_RETRIES):
+        if not fake_timer.instances:
+            break
+        fake_timer.instances.pop(0).fire()
+
+    assert "9.9.9.9" not in p_service.load_cache()["reports"]

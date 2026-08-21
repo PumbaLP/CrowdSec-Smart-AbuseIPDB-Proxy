@@ -85,13 +85,32 @@ def test_reservation_lifts_once_remaining_is_above_threshold(make_proxy):
     assert p.quota_reserved_for(1) is False
 
 
-def test_new_low_severity_ip_is_held_back_when_reserved(make_proxy, deferred_thread):
+def test_new_low_severity_ip_is_held_back_when_reserved(make_proxy, fake_timer, deferred_thread):
     p = make_proxy(ABUSEIPDB_QUOTA_RESERVE_HIGH="10")
     p.quota_state["remaining"] = 10
     p.process_alert("1.2.3.4", "14", "port scan", new_severity=1)
 
     assert p.metrics["reports_quota_reserved_total"] == 1
     assert "1.2.3.4" not in p.load_cache()["reports"]
+    # No longer dropped for good -- rescheduled to re-check the quota later.
+    assert "1.2.3.4" in p.load_cache()["pending"]
+    assert len(fake_timer.instances) == 1
+
+
+def test_held_back_report_is_actually_sent_once_quota_is_freed_up(
+    make_proxy, fake_timer, deferred_thread
+):
+    p = make_proxy(ABUSEIPDB_QUOTA_RESERVE_HIGH="10")
+    p.quota_state["remaining"] = 10
+    p.process_alert("1.2.3.4", "14", "port scan", new_severity=1)
+    assert "1.2.3.4" not in p.load_cache()["reports"]
+
+    # Quota pressure eases before the re-check fires.
+    p.quota_state["remaining"] = 500
+    fake_timer.instances[0].fire()
+
+    assert "1.2.3.4" in p.load_cache()["reports"]
+    assert "1.2.3.4" not in p.load_cache()["pending"]
 
 
 def test_high_severity_still_goes_through_when_reserved_for_it(make_proxy, deferred_thread):
@@ -103,7 +122,7 @@ def test_high_severity_still_goes_through_when_reserved_for_it(make_proxy, defer
     assert "1.2.3.4" in p.load_cache()["reports"]
 
 
-def test_pending_escalation_is_dropped_if_quota_becomes_reserved_before_it_fires(
+def test_pending_escalation_is_deferred_if_quota_becomes_reserved_before_it_fires(
     make_proxy, fake_timer, deferred_thread
 ):
     p = make_proxy(ABUSEIPDB_QUOTA_RESERVE_HIGH="10")
@@ -116,7 +135,33 @@ def test_pending_escalation_is_dropped_if_quota_becomes_reserved_before_it_fires
     fake_timer.instances[0].fire()
 
     assert p.metrics["reports_quota_reserved_total"] == 1
-    assert "1.2.3.4" not in p.load_cache()["pending"]
+    # No longer dropped for good -- re-armed as a fresh pending entry at
+    # the same severity, to be re-checked once the quota re-check delay
+    # elapses, instead of the escalation vanishing.
+    assert "1.2.3.4" in p.load_cache()["pending"]
+    assert p.load_cache()["pending"]["1.2.3.4"]["severity"] == 2
+    assert len(fake_timer.instances) == 2
+
+
+def test_deferred_quota_recheck_does_not_get_evicted_by_a_lower_new_alert(
+    make_proxy, fake_timer, deferred_thread
+):
+    # A quota re-check pending entry (created via the "no entry" branch,
+    # since a held-back *new* IP has no "reports" row yet) must not be
+    # displaced by a subsequently-arriving lower-severity alert for the
+    # same IP -- same precedence rule already applied to escalations.
+    p = make_proxy(ABUSEIPDB_QUOTA_RESERVE_HIGH="10")
+    p.quota_state["remaining"] = 10
+    p.process_alert("1.2.3.4", "18", "brute-force", new_severity=2)
+    assert "1.2.3.4" in p.load_cache()["pending"]
+    assert p.load_cache()["pending"]["1.2.3.4"]["severity"] == 2
+    first_timer = fake_timer.instances[0]
+
+    p.process_alert("1.2.3.4", "14", "port scan", new_severity=1)
+
+    assert p.load_cache()["pending"]["1.2.3.4"]["severity"] == 2
+    assert not first_timer.cancelled
+    assert p.metrics["reports_suppressed_total"] == 1
 
 
 # --- Local-port access control ----------------------------------------------

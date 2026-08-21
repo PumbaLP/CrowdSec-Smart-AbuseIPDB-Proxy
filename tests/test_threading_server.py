@@ -202,3 +202,56 @@ def test_max_concurrent_requests_zero_disables_the_limit(running_server):
         results = list(pool.map(lambda i: _post(base_url, f"203.0.201.{i}"), range(25)))
 
     assert all(status == 200 for status, _ in results)
+
+
+def test_real_concurrent_escalation_and_retry_does_not_corrupt_retry_queue(running_server):
+    """
+    Real (not simulated) concurrency stress test for the retry-chain-race
+    fix (_cancel_active_retry_chain): a first report for an ip fails and
+    starts an actual (short-delay) retry backoff, while genuine concurrent
+    escalations for the SAME ip keep arriving from real threads hitting
+    the real HTTP server, each capable of starting its own send_with_retry
+    thread. Runs several rounds to shake out any timing-dependent
+    corruption that a single run might miss.
+    """
+    p, base_url = running_server(ABUSEIPDB_RETRY_DELAY="1", ABUSEIPDB_REPORT_WINDOW="0")
+
+    call_count = {"n": 0}
+    call_lock = threading.Lock()
+
+    def flaky_send(ip, categories, comment):
+        with call_lock:
+            call_count["n"] += 1
+            n = call_count["n"]
+        # Roughly half fail, half succeed -- deliberately unpredictable
+        # which chain "wins", the point is that the cache never ends up
+        # in a corrupted/inconsistent state no matter which one does.
+        return (n % 2 == 0), None
+
+    p.send_report_api = flaky_send
+
+    for round_n in range(10):
+        ip = f"198.51.100.{round_n}"
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(
+                lambda i: _post(base_url, ip, categories="18" if i % 2 else "14",
+                                 comment=f"round{round_n}-{i}"),
+                range(8),
+            ))
+        assert all(status == 200 for status, _ in results)
+
+    time.sleep(2.5)  # let any real retry timers (1s delay) fire
+
+    # The cache must remain internally consistent no matter how the races
+    # above resolved: every ip that has a "reports" row must NOT also be
+    # stuck with a retry_queue row referencing a chain that will never
+    # fire again (the corrupted state the race could previously cause),
+    # and vice versa there must be no orphaned retry_queue row for an ip
+    # with no corresponding report and no active in-memory timer for it.
+    cache = p.load_cache()
+    for ip, retry_info in cache["retry_queue"].items():
+        assert ip in p.retry_timers, (
+            f"{ip} has a persisted retry_queue row but no active in-memory "
+            f"timer -- it will never fire, exactly the corruption "
+            f"_cancel_active_retry_chain is meant to prevent"
+        )
