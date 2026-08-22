@@ -77,6 +77,35 @@ def test_retention_configurable(make_proxy):
     assert p.BACKUP_RETENTION == 30
 
 
+def test_negative_retention_falls_back_to_zero_not_a_crash(make_proxy):
+    # run_backup()'s pruning loop is `while len(existing) > BACKUP_RETENTION:
+    # existing.pop(0)` -- a negative retention keeps that condition true
+    # even once the list is already empty (0 > -1), so the next pop(0)
+    # would raise IndexError. Must fail closed to 0 ("keep no backups")
+    # instead of crashing --backup / the backup timer.
+    p = make_proxy(ABUSEIPDB_BACKUP_RETENTION="-1")
+    assert p.BACKUP_RETENTION == 0
+
+
+def test_run_backup_does_not_crash_with_retention_forced_negative(make_proxy, tmp_path):
+    # Belt-and-suspenders: even if BACKUP_RETENTION's own guard were ever
+    # bypassed (e.g. a future caller sets the module attribute directly),
+    # run_backup() itself must not crash pruning down to an already-empty
+    # backup directory. A negative value floors to 0 ("keep no backups"),
+    # so the backup just written gets pruned again immediately too --
+    # that's the correct behavior for retention=0, not a bug; the actual
+    # thing under test here is that this doesn't raise IndexError.
+    p = make_proxy(ABUSEIPDB_CROWDSEC_BOUNCER_KEY="x")
+    p.save_cache({"reports": {"1.2.3.4": {"time": 1, "severity": 1}}, "pending": {}, "retry_queue": {}})
+    p.BACKUP_RETENTION = -1
+    backup_dir = str(tmp_path / "backups")
+
+    result = p.run_backup(backup_dir=backup_dir)  # must not raise
+
+    assert result["retention"] == 0
+    assert os.listdir(backup_dir) == []  # the one backup written was pruned right back out, as expected for retention=0
+
+
 def test_reports_pruned_filenames(make_proxy, tmp_path):
     p = make_proxy(ABUSEIPDB_BACKUP_RETENTION="1")
     backup_dir = str(tmp_path / "backups")

@@ -1,5 +1,7 @@
 """load_cache() / save_cache() with ABUSEIPDB_CACHE_BACKEND=sqlite."""
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -418,3 +420,37 @@ def test_process_alert_triggers_the_sweep_and_respects_its_interval(proxy, defer
     proxy.process_alert("1.2.3.4", "15", "test", new_severity=1)
 
     assert "stale.ip" not in proxy.load_cache()["reports"]
+
+
+def test_concurrent_sweep_calls_only_claim_the_interval_once(sqlite_proxy):
+    """
+    Regression test for moving the sweep's DELETE outside the main `lock`
+    (so it no longer blocks concurrent per-ip alert processing): the
+    "is a sweep due, and if so, claim it" check now runs under its own
+    dedicated `_sweep_lock` rather than the caller already holding
+    `lock` for it. Confirms many genuinely concurrent callers still only
+    let exactly one of them see "yes, it's due" -- not each of them
+    racing the read-then-write of `_last_stale_report_sweep` and all
+    deciding it's their turn.
+    """
+    sqlite_proxy._last_stale_report_sweep = 0.0
+    claims = []
+    claims_lock = threading.Lock()
+
+    real_delete = sqlite_proxy._sqlite_connect
+
+    def counting_connect(*args, **kwargs):
+        # Runs unlocked (by design) -- just observing here, not
+        # synchronizing, so a race would actually show up as >1 claim.
+        with claims_lock:
+            claims.append(1)
+        return real_delete(*args, **kwargs)
+
+    sqlite_proxy._sqlite_connect = counting_connect
+    try:
+        with ThreadPoolExecutor(max_workers=20) as pool:
+            list(pool.map(lambda _: sqlite_proxy._maybe_sweep_stale_reports(), range(20)))
+    finally:
+        sqlite_proxy._sqlite_connect = real_delete
+
+    assert len(claims) == 1

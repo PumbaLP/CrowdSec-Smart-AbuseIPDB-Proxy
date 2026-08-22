@@ -85,6 +85,27 @@ def test_reservation_lifts_once_remaining_is_above_threshold(make_proxy):
     assert p.quota_reserved_for(1) is False
 
 
+def test_zero_quota_reserve_recheck_delay_falls_back_to_the_safe_default(make_proxy):
+    # A 0 (or negative) recheck delay would mean a quota re-check
+    # reschedules itself via an essentially-immediate threading.Timer for
+    # as long as quota stays reserved -- which can be indefinite (e.g. a
+    # HIGH/MEDIUM reserve set above the actual daily limit) -- an
+    # unbounded tight loop rather than a bounded few-retries situation.
+    # Must fail closed to the safe default instead.
+    p = make_proxy(ABUSEIPDB_QUOTA_RESERVE_RECHECK_DELAY="0")
+    assert p.QUOTA_RESERVE_RECHECK_DELAY == 300
+
+
+def test_negative_quota_reserve_recheck_delay_falls_back_to_the_safe_default(make_proxy):
+    p = make_proxy(ABUSEIPDB_QUOTA_RESERVE_RECHECK_DELAY="-5")
+    assert p.QUOTA_RESERVE_RECHECK_DELAY == 300
+
+
+def test_positive_quota_reserve_recheck_delay_is_honored(make_proxy):
+    p = make_proxy(ABUSEIPDB_QUOTA_RESERVE_RECHECK_DELAY="45")
+    assert p.QUOTA_RESERVE_RECHECK_DELAY == 45
+
+
 def test_new_low_severity_ip_is_held_back_when_reserved(make_proxy, fake_timer, deferred_thread):
     p = make_proxy(ABUSEIPDB_QUOTA_RESERVE_HIGH="10")
     p.quota_state["remaining"] = 10

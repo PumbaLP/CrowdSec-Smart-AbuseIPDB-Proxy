@@ -255,3 +255,28 @@ def test_real_concurrent_escalation_and_retry_does_not_corrupt_retry_queue(runni
             f"timer -- it will never fire, exactly the corruption "
             f"_cancel_active_retry_chain is meant to prevent"
         )
+
+
+def test_non_string_ip_field_is_rejected_not_silently_coerced(running_server):
+    """
+    Regression test: ipaddress.ip_address() silently accepts an int
+    (interpreting it as a packed address) instead of raising, so an "ip"
+    field that's a JSON number rather than a string used to sail straight
+    through is_ignored_ip()/is_whitelisted() and get treated as a real
+    address. A malformed/malicious POST with a numeric "ip" must now be
+    a no-op (still 200 OK, matching how a missing "ip" is already
+    handled) rather than silently generating a report for whatever
+    address that integer happens to decode to.
+    """
+    p, base_url = running_server()
+
+    body = json.dumps({"ip": 16909060, "categories": "15", "comment": "x"}).encode("utf-8")
+    req = urllib.request.Request(base_url + "/", data=body, method="POST",
+                                  headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        status = resp.status
+
+    assert status == 200
+    # 16909060 decodes to 1.2.3.4 -- confirm THAT never got reported either.
+    assert "1.2.3.4" not in p.load_cache()["reports"]
+    assert p.load_cache()["reports"] == {}
