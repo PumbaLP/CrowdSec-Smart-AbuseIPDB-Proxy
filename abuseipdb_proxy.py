@@ -29,7 +29,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 
-VERSION = "3.0.3"
+VERSION = "3.0.4"
 
 START_TIME = time.time()
 
@@ -806,6 +806,7 @@ CREATE TABLE IF NOT EXISTS reports (
     time INTEGER NOT NULL,
     severity INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_reports_time ON reports(time);
 CREATE TABLE IF NOT EXISTS pending (
     ip TEXT PRIMARY KEY,
     due_time INTEGER NOT NULL,
@@ -1057,6 +1058,19 @@ def _sqlite_delete_retry(ip, path=None):
 _last_stale_report_sweep = 0.0
 _STALE_REPORT_SWEEP_INTERVAL = 3600  # 1 hour
 _STALE_REPORT_AGE = 86400  # 24h — same window process_alert()/vacuum_cache() already used
+# Dedicated lock, deliberately separate from the main `lock` used for
+# per-ip dedup/escalation decisions. Only guards the tiny "is a sweep due,
+# and if so, claim it" check below -- the DELETE itself runs without
+# holding either lock. A stale-report sweep is a purely global,
+# ip-independent maintenance operation (nothing about any single ip's
+# dedup decision depends on whether some *other*, unrelated ip's
+# long-expired row has been pruned yet), so there's no correctness reason
+# to make every concurrent alert across every ip in the system wait on it
+# -- doing so would mean an aging `reports` table (now indexed on `time`,
+# but still a full-table DELETE) periodically adds hold time to the one
+# lock every single incoming alert needs, for maintenance that alert has
+# nothing to do with.
+_sweep_lock = threading.Lock()
 
 
 def _maybe_sweep_stale_reports():
@@ -1073,9 +1087,10 @@ def _maybe_sweep_stale_reports():
     runs for anyone who hasn't set up the vacuum timer."""
     global _last_stale_report_sweep
     now = time.time()
-    if now - _last_stale_report_sweep < _STALE_REPORT_SWEEP_INTERVAL:
-        return
-    _last_stale_report_sweep = now
+    with _sweep_lock:
+        if now - _last_stale_report_sweep < _STALE_REPORT_SWEEP_INTERVAL:
+            return
+        _last_stale_report_sweep = now
     conn = _sqlite_connect()
     try:
         with conn:
@@ -1116,8 +1131,23 @@ QUOTA_RESERVE_HIGH = int(os.getenv("ABUSEIPDB_QUOTA_RESERVE_HIGH", "0"))
 # back because the daily quota was reserved for a higher severity tier.
 # Without this, a held-back report used to be silently dropped for good
 # once the quota reservation kicked in -- now it's rescheduled to check
-# again later instead of vanishing.
+# again later instead of vanishing. Enforced positive: unlike a normal
+# retry (bounded by MAX_RETRIES, so a too-short RETRY_DELAY just means a
+# few fast attempts before giving up), a quota re-check keeps
+# rescheduling itself for as long as quota stays reserved -- which can be
+# indefinitely (e.g. a HIGH/MEDIUM reserve set above the actual daily
+# limit). A 0 or negative delay would turn that into an unbounded tight
+# loop of near-instant timer refires, hammering the lock and the DB as
+# fast as the process can spin instead of waiting.
 QUOTA_RESERVE_RECHECK_DELAY = int(os.getenv("ABUSEIPDB_QUOTA_RESERVE_RECHECK_DELAY", "300"))
+if QUOTA_RESERVE_RECHECK_DELAY <= 0:
+    log(
+        f"ABUSEIPDB_QUOTA_RESERVE_RECHECK_DELAY={QUOTA_RESERVE_RECHECK_DELAY} must be positive "
+        f"(a quota re-check reschedules itself indefinitely while quota stays reserved, so a "
+        f"non-positive delay risks an unbounded tight loop) -- using 300 instead.",
+        level="warning",
+    )
+    QUOTA_RESERVE_RECHECK_DELAY = 300
 
 
 def quota_reserved_for(severity):
@@ -1525,10 +1555,13 @@ def process_alert(ip, categories, comment, new_severity):
     entire cache on every single call, which meant the true cost was
     proportional to the total number of tracked IPs, not to "one new
     alert." _maybe_sweep_stale_reports() replaces the inline full-table
-    prune that used to happen here on every call."""
+    prune that used to happen here on every call. Called before acquiring
+    `lock` below (see _maybe_sweep_stale_reports()'s docstring for why
+    that's safe) so its DELETE never adds hold time to the one lock every
+    concurrent alert across every ip needs."""
     now = int(time.time())
+    _maybe_sweep_stale_reports()
     with lock:
-        _maybe_sweep_stale_reports()
         entry = _sqlite_get_report(ip)
         if entry and entry.get("time", 0) <= now - 86400:
             entry = None  # stale — treated the same as "no entry"; the row
@@ -1800,10 +1833,23 @@ class AbuseIPDBHandler(http.server.BaseHTTPRequestHandler):
 
             data = json.loads(body.decode('utf-8'))
             ip = data.get("ip")
-            categories = data.get("categories", "15").strip()
+            categories = data.get("categories", "15")
             comment = data.get("comment", "CrowdSec Alert")
+            # CrowdSec's own HTTP notification plugin always sends these as
+            # strings, but nothing stops a malformed/malicious POST from
+            # sending e.g. an integer for "ip" -- ipaddress.ip_address()
+            # silently accepts an int (interpreting it as a packed address)
+            # rather than rejecting it, so without this check a numeric
+            # "ip" would sail through is_ignored_ip()/is_whitelisted()
+            # and get treated as a real address instead of being rejected
+            # as the malformed input it actually is.
+            if not isinstance(categories, str):
+                categories = "15"
+            if not isinstance(comment, str):
+                comment = "CrowdSec Alert"
+            categories = categories.strip()
 
-            if ip:
+            if isinstance(ip, str) and ip:
                 if is_ignored_ip(ip):
                     if VERBOSE_LOGGING:
                         log(f"Ignoring private/excluded IP {ip}.", ip=ip)
@@ -2273,7 +2319,8 @@ def check_config():
              f"normally be >= the high reserve, since it also covers severity 2")
     elif QUOTA_RESERVE_HIGH or QUOTA_RESERVE_MEDIUM:
         ok(f"Quota reservation active: {QUOTA_RESERVE_HIGH} reserved for high, "
-           f"{QUOTA_RESERVE_MEDIUM} reserved for medium+")
+           f"{QUOTA_RESERVE_MEDIUM} reserved for medium+, re-checked every "
+           f"{QUOTA_RESERVE_RECHECK_DELAY}s while reserved")
 
     # --- Whitelist pre-check ---
     if SKIP_WHITELISTED and DRY_RUN:
@@ -2575,6 +2622,18 @@ def format_doctor_output(results):
 
 
 BACKUP_RETENTION = int(os.getenv("ABUSEIPDB_BACKUP_RETENTION", "14"))
+if BACKUP_RETENTION < 0:
+    # run_backup()'s pruning loop is `while len(existing) > BACKUP_RETENTION:
+    # existing.pop(0)` -- with a negative retention, that condition stays
+    # true even once `existing` is already empty (0 > -1), so the very
+    # next pop(0) raises IndexError instead of just meaning "keep no
+    # backups" (which 0, not a negative number, already means).
+    log(
+        f"ABUSEIPDB_BACKUP_RETENTION={BACKUP_RETENTION} is invalid (must be >= 0; "
+        f"0 means keep no backups) -- using 0 instead.",
+        level="warning",
+    )
+    BACKUP_RETENTION = 0
 
 
 def run_migrate_to_sqlite(source_path, target_path=None):
@@ -2648,7 +2707,14 @@ def run_backup(backup_dir=None):
         if f.startswith("cache-") and f.endswith(".json")
     )
     pruned = []
-    while len(existing) > BACKUP_RETENTION:
+    retention = max(0, BACKUP_RETENTION)  # defensive floor: BACKUP_RETENTION is
+    # already validated non-negative at module load, but the loop below
+    # (`len(existing) > retention`, popping from the front) would raise
+    # IndexError on a negative value the instant `existing` empties out --
+    # keeping the floor right here too means this function can never crash
+    # on this, regardless of how BACKUP_RETENTION ends up set by the time
+    # this runs.
+    while len(existing) > retention:
         oldest = existing.pop(0)
         try:
             os.remove(os.path.join(backup_dir, oldest))
@@ -2658,10 +2724,10 @@ def run_backup(backup_dir=None):
 
     log(f"Backed up cache to {backup_path}.", path=backup_path)
     if pruned:
-        log(f"Pruned {len(pruned)} old backup(s) beyond the {BACKUP_RETENTION}-backup retention.",
+        log(f"Pruned {len(pruned)} old backup(s) beyond the {retention}-backup retention.",
             pruned_count=len(pruned))
 
-    return {"backup_path": backup_path, "pruned": pruned, "retention": BACKUP_RETENTION}
+    return {"backup_path": backup_path, "pruned": pruned, "retention": retention}
 
 
 def fetch_crowdsec_active_decisions():
