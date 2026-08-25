@@ -3,7 +3,7 @@ Description=CrowdSec Smart AbuseIPDB Proxy
 After=network.target
 
 [Service]
-Type=simple
+Type=notify
 User=root
 EnvironmentFile=/etc/abuseipdb-proxy/abuseipdb-proxy.env
 ExecStart=/usr/local/bin/abuseipdb_proxy.py

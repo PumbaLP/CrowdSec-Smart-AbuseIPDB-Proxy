@@ -16,6 +16,8 @@ import http.server
 import ipaddress
 import json
 import re
+import signal
+import socket
 import stat
 import subprocess
 import time
@@ -27,9 +29,9 @@ import sqlite3
 import sys
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-VERSION = "3.0.4"
+VERSION = "3.1.0"
 
 START_TIME = time.time()
 
@@ -164,6 +166,32 @@ def log(message, level="info", **fields):
         sys.stderr.write(json.dumps(record) + "\n")
     else:
         sys.stderr.write(f"[abuseipdb-proxy] {message}\n")
+
+
+def _sd_notify(state):
+    """Sends a state update to systemd via $NOTIFY_SOCKET, if set -- i.e.
+    only does anything under a unit file with Type=notify (the shipped
+    abuseipdb-proxy.service uses it). A no-op everywhere else (Docker,
+    running manually, Type=simple), and best-effort even when the socket
+    exists -- a missing/broken NOTIFY_SOCKET must never be able to crash
+    startup or block a shutdown. See https://www.freedesktop.org/software/
+    systemd/man/latest/sd_notify.html for the state strings systemd
+    understands ("READY=1", "STOPPING=1", "STATUS=...", etc.)."""
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]  # abstract namespace socket
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        sock.connect(addr)
+        sock.sendall(state.encode())
+    except OSError:
+        pass
+    finally:
+        if sock is not None:
+            sock.close()
 
 # Default time window in seconds during which a report for the same IP is
 # either suppressed or delayed until an escalation is due. Can be overridden
@@ -694,6 +722,22 @@ SEVERITY_MAP = {
     "23": 2,  # IoT Targeted
 }
 
+# Same category IDs as SEVERITY_MAP above, just human-readable -- used by
+# --simulate's output and by check_config()'s category-typo check. Kept
+# as a separate dict (rather than parsing SEVERITY_MAP's inline comments,
+# which Python doesn't preserve at runtime) but sourced from the exact
+# same AbuseIPDB category list, so the two can't drift apart on which
+# IDs exist.
+CATEGORY_NAMES = {
+    "1": "DNS Compromise", "2": "DNS Poisoning", "3": "Fraud Orders",
+    "4": "DDoS Attack", "5": "FTP Brute-Force", "6": "Ping of Death",
+    "7": "Phishing", "8": "Fraud VoIP", "9": "Open Proxy", "10": "Web Spam",
+    "11": "Email Spam", "12": "Blog Spam", "13": "VPN IP", "14": "Port Scan",
+    "15": "Hacking", "16": "SQL Injection", "17": "Spoofing", "18": "Brute-Force",
+    "19": "Bad Web Bot", "20": "Exploited Host", "21": "Web App Attack",
+    "22": "SSH", "23": "IoT Targeted",
+}
+
 # RLock, not Lock: process_alert() holds this for its entire decide-then-write
 # sequence and can call _schedule_pending() from inside that same block,
 # which itself needs to acquire this lock to be safe if ever called from
@@ -754,6 +798,85 @@ def get_report_window(severity, categories_str=""):
         if overrides:
             return min(overrides)
     return REPORT_WINDOWS.get(severity, DEFAULT_REPORT_WINDOW)
+
+
+def simulate_alert(categories_str, comment=None):
+    """Pure, side-effect-free preview of how a given categories string
+    would be handled by a live alert: the severity it maps to, the
+    report window that would apply (and whether that's a per-category
+    override or the severity-tier default), whether it would currently
+    be held back by quota reservation, and -- if a comment was given --
+    what it would look like after comment-scrubbing. Meant for testing a
+    configuration change (severity mapping, category windows, quota
+    reserve thresholds, scrub patterns) without generating a real report
+    or even needing a test IP. Reads the *persisted* quota snapshot (the
+    same one --stats/--doctor use), not the live in-memory quota_state --
+    this runs as a one-off CLI process, same as those, so there is no
+    live quota_state of its own to read; AbuseIPDB's own header value is
+    authoritative regardless of which process last saw it."""
+    cats = [c.strip() for c in categories_str.split(",") if c.strip()]
+    severity = get_severity(categories_str)
+    window = get_report_window(severity, categories_str)
+
+    override_cats = [c for c in cats if c in CATEGORY_WINDOWS]
+    if override_cats:
+        window_source = "category override (" + ", ".join(
+            f"{c}={CATEGORY_WINDOWS[c]}s" for c in override_cats
+        ) + ")"
+    else:
+        window_source = f"severity {severity} default"
+
+    quota = load_quota_state()
+    reserved = _quota_reserved_for_remaining(severity, quota["remaining"])
+
+    result = {
+        "categories": cats,
+        "category_names": {c: CATEGORY_NAMES.get(c, "unknown category") for c in cats},
+        "unknown_categories": [c for c in cats if c not in SEVERITY_MAP],
+        "severity": severity,
+        "severity_name": _SEVERITY_NAMES.get(severity, "?"),
+        "report_window_seconds": window,
+        "report_window_source": window_source,
+        "quota_known": quota["remaining"] is not None,
+        "quota_remaining": quota["remaining"],
+        "quota_reserved": reserved,
+        "quota_recheck_delay_seconds": QUOTA_RESERVE_RECHECK_DELAY if reserved else None,
+    }
+    if comment is not None:
+        result["comment"] = comment
+        result["comment_after_scrubbing"] = scrub_comment(comment)
+    return result
+
+
+def format_simulate_text(result):
+    lines = ["=== Simulated Alert ==="]
+    cat_desc = ", ".join(f"{c} ({result['category_names'][c]})" for c in result["categories"]) \
+        if result["categories"] else "(none)"
+    lines.append(f"Categories: {cat_desc}")
+    if result["unknown_categories"]:
+        lines.append(
+            f"  ⚠ unrecognized categor{'y' if len(result['unknown_categories']) == 1 else 'ies'}: "
+            + ", ".join(result["unknown_categories"])
+            + " (not a valid AbuseIPDB category ID — treated as severity 1 by default, "
+              "check for a typo)"
+        )
+    lines.append(f"Derived severity: {result['severity']} ({result['severity_name']})")
+    lines.append(f"Report window: {result['report_window_seconds']}s ({result['report_window_source']})")
+    lines.append("")
+    if not result["quota_known"]:
+        lines.append("Quota reservation: unknown (no report sent yet since the last quota reset)")
+    elif result["quota_reserved"]:
+        lines.append(
+            f"Quota reservation: WOULD BE HELD BACK right now ({result['quota_remaining']} remaining) "
+            f"-- re-checked every {result['quota_recheck_delay_seconds']}s until quota frees up"
+        )
+    else:
+        lines.append(f"Quota reservation: would send immediately ({result['quota_remaining']} remaining)")
+    if "comment" in result:
+        lines.append("")
+        lines.append(f"Comment (as given):      {result['comment']}")
+        lines.append(f"Comment (after scrubbing): {result['comment_after_scrubbing']}")
+    return "\n".join(lines)
 
 
 def ensure_cache_dir():
@@ -824,6 +947,23 @@ CREATE TABLE IF NOT EXISTS retry_queue (
 """
 
 
+def _ensure_column(conn, table, column, coltype):
+    """Adds `column` to `table` if it doesn't already exist. SQLite has no
+    ADD COLUMN IF NOT EXISTS, so this just attempts it and swallows the
+    resulting "duplicate column" error on every subsequent connection —
+    the same idempotent-migration pattern _SQLITE_SCHEMA already uses via
+    CREATE TABLE/INDEX IF NOT EXISTS, extended to cover a column added to
+    an existing table after that table already shipped. A row that
+    predates this migration keeps SQLite's normal NULL for the new
+    column; callers already have to handle that as "unknown", same as
+    any other missing/legacy data."""
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e).lower():
+            raise
+
+
 def _sqlite_connect(path=None):
     ensure_cache_dir()
     conn = sqlite3.connect(path or CACHE_FILE, timeout=10)
@@ -834,6 +974,11 @@ def _sqlite_connect(path=None):
         conn.execute(f"PRAGMA journal_mode={CACHE_SQLITE_JOURNAL_MODE}")
         conn.execute(f"PRAGMA synchronous={CACHE_SQLITE_SYNCHRONOUS}")
         conn.executescript(_SQLITE_SCHEMA)
+        # created_at wasn't part of the original pending/retry_queue
+        # schema -- added later so /health can report how long the
+        # oldest still-waiting entry has been stuck, not just a count.
+        _ensure_column(conn, "pending", "created_at", "INTEGER")
+        _ensure_column(conn, "retry_queue", "created_at", "INTEGER")
     except Exception:
         # sqlite3.connect() succeeds even for a path that can't actually
         # be opened — SQLite defers the real file open until the first
@@ -1013,11 +1158,19 @@ def _sqlite_upsert_pending(ip, due_time, severity, categories, comment, path=Non
     conn = _sqlite_connect(path)
     try:
         with conn:
+            # created_at deliberately excluded from the ON CONFLICT UPDATE
+            # clause below -- set only on first INSERT, so it tracks how
+            # long this ip has been continuously waiting (through however
+            # many quota-recheck reschedules), not the time of the most
+            # recent reschedule. A genuinely new wait (the old row was
+            # DELETEd first, e.g. a higher-severity escalation evicting a
+            # lower one) inserts fresh and correctly gets a new created_at.
             conn.execute(
-                "INSERT INTO pending (ip, due_time, severity, categories, comment) VALUES (?, ?, ?, ?, ?) "
+                "INSERT INTO pending (ip, due_time, severity, categories, comment, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(ip) DO UPDATE SET due_time = excluded.due_time, severity = excluded.severity, "
                 "categories = excluded.categories, comment = excluded.comment",
-                (ip, due_time, severity, categories, comment),
+                (ip, due_time, severity, categories, comment, int(time.time())),
             )
     finally:
         conn.close()
@@ -1036,11 +1189,17 @@ def _sqlite_upsert_retry(ip, due_time, categories, comment, attempts, path=None)
     conn = _sqlite_connect(path)
     try:
         with conn:
+            # Same created_at-only-on-first-INSERT reasoning as
+            # _sqlite_upsert_pending() above -- preserved across repeated
+            # failed attempts of the *same* chain, reset only when a
+            # genuinely new chain starts (old row deleted first, e.g. by
+            # _cancel_active_retry_chain()).
             conn.execute(
-                "INSERT INTO retry_queue (ip, due_time, categories, comment, attempts) VALUES (?, ?, ?, ?, ?) "
+                "INSERT INTO retry_queue (ip, due_time, categories, comment, attempts, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(ip) DO UPDATE SET due_time = excluded.due_time, categories = excluded.categories, "
                 "comment = excluded.comment, attempts = excluded.attempts",
-                (ip, due_time, categories, comment, attempts),
+                (ip, due_time, categories, comment, attempts, int(time.time())),
             )
     finally:
         conn.close()
@@ -1053,6 +1212,25 @@ def _sqlite_delete_retry(ip, path=None):
             conn.execute("DELETE FROM retry_queue WHERE ip = ?", (ip,))
     finally:
         conn.close()
+
+
+def _oldest_entry_age(table):
+    """Seconds since the oldest still-waiting entry in `pending` or
+    `retry_queue` was first created (see created_at's INSERT-only
+    semantics above) -- None if the table's empty, or if the oldest row
+    predates the created_at migration (legacy NULL). Exposed via /health
+    so a monitoring tool can alert on "something's been stuck for N
+    minutes" directly, rather than only seeing a bare count that doesn't
+    distinguish a healthy, fast-draining queue from a stuck one."""
+    conn = _sqlite_connect()
+    try:
+        row = conn.execute(f"SELECT MIN(created_at) FROM {table}").fetchone()
+    finally:
+        conn.close()
+    oldest = row[0] if row else None
+    if oldest is None:
+        return None
+    return max(0, int(time.time()) - oldest)
 
 
 _last_stale_report_sweep = 0.0
@@ -1108,7 +1286,15 @@ def _maybe_sweep_stale_reports():
 # /metrics (same process), but --stats runs as a separate one-shot
 # process and has no other way to see what the live service last saw.
 quota_lock = threading.Lock()
-quota_state = {"limit": None, "remaining": None, "updated_at": None}
+quota_state = {
+    "limit": None, "remaining": None, "updated_at": None,
+    # Baseline for the exhaustion-rate estimate below: the first
+    # "remaining" value seen on the current UTC day, and when it was
+    # seen. Reset automatically whenever a new UTC day is detected (see
+    # _update_quota_from_headers()), matching AbuseIPDB's own daily
+    # 00:00 UTC quota reset.
+    "day": None, "day_start_remaining": None, "day_start_time": None,
+}
 _quota_warned_date = None  # UTC date string; reset naturally at the daily rollover
 
 QUOTA_WARN_THRESHOLD = int(os.getenv("ABUSEIPDB_QUOTA_WARN_THRESHOLD", "50"))
@@ -1150,11 +1336,15 @@ if QUOTA_RESERVE_RECHECK_DELAY <= 0:
     QUOTA_RESERVE_RECHECK_DELAY = 300
 
 
-def quota_reserved_for(severity):
-    """True if a report of this severity should be held back right now
-    because the remaining daily quota is reserved for a higher tier."""
-    with quota_lock:
-        remaining = quota_state.get("remaining")
+def _quota_reserved_for_remaining(severity, remaining):
+    """The actual reservation-threshold comparison, factored out so both
+    the live path (quota_reserved_for(), reading the in-memory
+    quota_state) and --simulate (reading the persisted snapshot via
+    load_quota_state(), since it runs as a separate one-off CLI process
+    with no live quota_state of its own) use the exact same logic rather
+    than two copies that can silently drift apart -- exactly the kind of
+    duplication that caused a real bug earlier in this file's history
+    (see CHANGELOG 3.0.3, the resume_state_from_cache() report_time gap)."""
     if remaining is None:
         return False
     if severity < 3 and QUOTA_RESERVE_HIGH > 0 and remaining <= QUOTA_RESERVE_HIGH:
@@ -1162,6 +1352,14 @@ def quota_reserved_for(severity):
     if severity < 2 and QUOTA_RESERVE_MEDIUM > 0 and remaining <= QUOTA_RESERVE_MEDIUM:
         return True
     return False
+
+
+def quota_reserved_for(severity):
+    """True if a report of this severity should be held back right now
+    because the remaining daily quota is reserved for a higher tier."""
+    with quota_lock:
+        remaining = quota_state.get("remaining")
+    return _quota_reserved_for_remaining(severity, remaining)
 
 
 def _save_quota_state():
@@ -1192,10 +1390,41 @@ def load_quota_state():
                 "limit": data.get("limit"),
                 "remaining": data.get("remaining"),
                 "updated_at": data.get("updated_at"),
+                "day": data.get("day"),
+                "day_start_remaining": data.get("day_start_remaining"),
+                "day_start_time": data.get("day_start_time"),
             }
     except (OSError, json.JSONDecodeError):
         pass
-    return {"limit": None, "remaining": None, "updated_at": None}
+    return {"limit": None, "remaining": None, "updated_at": None,
+            "day": None, "day_start_remaining": None, "day_start_time": None}
+
+
+def estimate_quota_exhaustion(quota):
+    """Given a quota snapshot (either the live quota_state or whatever
+    load_quota_state() returned for a separate --stats/--doctor process),
+    projects a UTC datetime for when today's remaining quota will hit
+    zero at the rate it's been consumed so far today -- or None if there
+    isn't enough data yet to make that projection meaningful. Purely
+    informational (a heads-up, not an alarm): early in the day, a
+    handful of reports can swing the projected rate wildly, and that's
+    an inherent property of extrapolating from a small sample, not a
+    bug -- which is exactly why this refuses to project at all until at
+    least a few minutes and at least one consumed report are behind it,
+    rather than returning a wildly noisy number from the very first
+    observation."""
+    remaining = quota.get("remaining")
+    day_start_remaining = quota.get("day_start_remaining")
+    day_start_time = quota.get("day_start_time")
+    if remaining is None or day_start_remaining is None or day_start_time is None:
+        return None
+    elapsed = time.time() - day_start_time
+    consumed = day_start_remaining - remaining
+    if elapsed < 300 or consumed <= 0:
+        return None
+    rate = consumed / elapsed  # reports per second
+    seconds_left = remaining / rate
+    return datetime.now(timezone.utc) + timedelta(seconds=seconds_left)
 
 
 def _update_quota_from_headers(headers):
@@ -1216,8 +1445,21 @@ def _update_quota_from_headers(headers):
         except (TypeError, ValueError):
             return
         quota_state["updated_at"] = int(time.time())
+
+        today = datetime.now(timezone.utc).date().isoformat()
+        if quota_state.get("day") != today:
+            # First observation of a new UTC day (including the very
+            # first observation ever) -- (re)establish the baseline the
+            # exhaustion-rate estimate above measures from. AbuseIPDB
+            # resets quota at 00:00 UTC, so anything from a previous day
+            # is irrelevant to today's consumption rate.
+            quota_state["day"] = today
+            quota_state["day_start_remaining"] = quota_state["remaining"]
+            quota_state["day_start_time"] = quota_state["updated_at"]
+
         remaining_now = quota_state["remaining"]
         limit_now = quota_state["limit"]
+        eta = estimate_quota_exhaustion(quota_state)
         _save_quota_state()
 
         # Deciding *and* marking "already warned today" both happen while
@@ -1225,17 +1467,17 @@ def _update_quota_from_headers(headers):
         # threads could both see the old date, both flip it, and both
         # fire the notification.
         if remaining_now is not None and remaining_now <= QUOTA_WARN_THRESHOLD:
-            today = datetime.now(timezone.utc).date().isoformat()
             if _quota_warned_date != today:
                 _quota_warned_date = today
                 should_notify = True
 
     if should_notify:
+        eta_str = f" At the current rate, it may run out around {eta.strftime('%H:%M UTC')}." if eta else ""
         log(f"AbuseIPDB daily quota is getting low: {remaining_now} report(s) remaining.",
             level="warning", quota_remaining=remaining_now, quota_limit=limit_now)
         notify(
             f"AbuseIPDB daily quota is getting low: only {remaining_now} report(s) remaining "
-            f"today (limit {limit_now}). Resets at 00:00 UTC.",
+            f"today (limit {limit_now}). Resets at 00:00 UTC.{eta_str}",
             priority="normal",
         )
 
@@ -1735,6 +1977,60 @@ def resume_state_from_cache():
 ORPHAN_RESCAN_INTERVAL = int(os.getenv("ABUSEIPDB_ORPHAN_RESCAN_INTERVAL", "60"))
 
 
+RETRY_BACKLOG_WARN_SIZE = int(os.getenv("ABUSEIPDB_RETRY_BACKLOG_WARN_SIZE", "20"))
+RETRY_BACKLOG_WARN_AGE = int(os.getenv("ABUSEIPDB_RETRY_BACKLOG_WARN_AGE", "900"))
+# Tracks a single ongoing "backlog episode": when the combined pending +
+# retry_queue count first crossed RETRY_BACKLOG_WARN_SIZE (None if it's
+# currently below that size), and whether that episode has already been
+# warned about. A count check alone would be noisy -- a busy install can
+# legitimately have dozens of pending escalations at any moment, that's
+# normal operation, not a problem. What actually signals "something's
+# wrong" (most likely: AbuseIPDB itself is down/erroring) is that count
+# staying elevated *continuously* for a while, rather than draining back
+# down the way normal escalation/retry traffic does.
+_backlog_over_threshold_since = None
+_backlog_warned = False
+
+
+def _check_retry_backlog(pending_count, retry_count):
+    """Warns (once per continuous episode, via notify() -- every
+    configured backend, same as any other alert here) if the combined
+    pending+retry backlog has stayed at or above RETRY_BACKLOG_WARN_SIZE
+    continuously for at least RETRY_BACKLOG_WARN_AGE seconds. Resets as
+    soon as the backlog drops back below the size threshold, so the next
+    episode (e.g. a second, later outage) gets its own fresh warning
+    rather than staying silently suppressed forever after the first one.
+    Set ABUSEIPDB_RETRY_BACKLOG_WARN_SIZE=0 to disable entirely."""
+    global _backlog_over_threshold_since, _backlog_warned
+    if RETRY_BACKLOG_WARN_SIZE <= 0:
+        return
+    combined = pending_count + retry_count
+    now = time.time()
+    if combined < RETRY_BACKLOG_WARN_SIZE:
+        _backlog_over_threshold_since = None
+        _backlog_warned = False
+        return
+    if _backlog_over_threshold_since is None:
+        _backlog_over_threshold_since = now
+        return
+    age = now - _backlog_over_threshold_since
+    if not _backlog_warned and age >= RETRY_BACKLOG_WARN_AGE:
+        _backlog_warned = True
+        log(
+            f"Pending/retry backlog has stayed at {combined} report(s) for over "
+            f"{int(age)}s -- possible sign AbuseIPDB itself is unreachable or "
+            f"erroring, not just one flaky IP.",
+            level="warning", backlog_count=combined, backlog_age_seconds=int(age),
+        )
+        notify(
+            f"AbuseIPDB proxy: {combined} report(s) have been stuck pending/retrying "
+            f"for over {int(age // 60)} minute(s). This usually means AbuseIPDB's API "
+            f"itself is down or erroring, rather than a problem with any single IP. "
+            f"Check `--doctor` / the logs.",
+            priority="high",
+        )
+
+
 def _reap_orphaned_timers():
     """Re-arms any persisted pending/retry row that has no matching live
     timer in this process. A row that already has one (the overwhelmingly
@@ -1785,6 +2081,8 @@ def _reap_orphaned_timers():
             f"live timer in this process (likely written by --reconcile).",
             level="info", reaped_pending=reaped_pending, reaped_retries=reaped_retries,
         )
+
+    _check_retry_backlog(len(pending_rows), len(retry_rows))
 
 
 def _orphan_rescan_loop():
@@ -1898,6 +2196,8 @@ class AbuseIPDBHandler(http.server.BaseHTTPRequestHandler):
             "cache_reports_tracked": count_tracked_reports(),
             "pending_escalations": len(pending_timers),
             "pending_retries": len(retry_timers),
+            "oldest_pending_escalation_age_seconds": _oldest_entry_age("pending"),
+            "oldest_pending_retry_age_seconds": _oldest_entry_age("retry_queue"),
             "abuseipdb_quota": quota,
         }).encode("utf-8")
         self.send_response(200)
@@ -2170,6 +2470,9 @@ def format_stats_text(stats, now=None):
     if quota["remaining"] is not None:
         as_of = f" (as of {_human_ago(quota['updated_at'], now)})" if quota["updated_at"] else ""
         lines.append(f"AbuseIPDB quota: {quota['remaining']}/{quota['limit']} remaining{as_of}")
+        eta = estimate_quota_exhaustion(quota)
+        if eta:
+            lines.append(f"  at the current rate, may run out around {eta.strftime('%H:%M UTC')}")
     else:
         lines.append("AbuseIPDB quota: unknown (no report sent yet since the last quota reset)")
 
@@ -2348,6 +2651,33 @@ def check_config():
         ok(f"Reconciliation configured against CrowdSec LAPI at {CROWDSEC_LAPI_URL} "
            f"(run with --reconcile)")
 
+    # --- Categories ---
+    # Both of these are free-text, comma-separated AbuseIPDB category IDs
+    # the user types by hand -- unlike categories that come from a live
+    # CrowdSec alert (which get their category string from CrowdSec
+    # itself), a typo here would otherwise only surface once a report
+    # actually goes out with a nonsensical category, or silently maps
+    # to severity 1 without anyone noticing.
+    reconcile_cats = [c.strip() for c in RECONCILE_CATEGORIES.split(",") if c.strip()]
+    unknown_reconcile_cats = [c for c in reconcile_cats if c not in CATEGORY_NAMES]
+    if unknown_reconcile_cats:
+        warn(f"ABUSEIPDB_RECONCILE_CATEGORIES contains unrecognized category "
+             f"ID(s): {', '.join(unknown_reconcile_cats)} — not in AbuseIPDB's "
+             f"current category list, double-check for a typo")
+    elif reconcile_cats:
+        names = ", ".join(f"{c} ({CATEGORY_NAMES[c]})" for c in reconcile_cats)
+        ok(f"ABUSEIPDB_RECONCILE_CATEGORIES: {names}")
+
+    if CATEGORY_WINDOWS:
+        unknown_window_cats = [c for c in CATEGORY_WINDOWS if c not in CATEGORY_NAMES]
+        if unknown_window_cats:
+            warn(f"ABUSEIPDB_REPORT_WINDOW_CATEGORIES contains unrecognized category "
+                 f"ID(s): {', '.join(unknown_window_cats)} — that override will never "
+                 f"match a real alert, double-check for a typo")
+        else:
+            ok(f"ABUSEIPDB_REPORT_WINDOW_CATEGORIES: {len(CATEGORY_WINDOWS)} category "
+               f"override(s) configured")
+
     # --- Timing / retries ---
     window_low, window_medium, window_high = REPORT_WINDOWS[1], REPORT_WINDOWS[2], REPORT_WINDOWS[3]
     for name, value in (("ABUSEIPDB_REPORT_WINDOW_LOW", window_low),
@@ -2521,6 +2851,20 @@ def run_doctor(check_network=True):
         ok(f"Cache is readable ({len(cache.get('reports', {}))} report(s) currently tracked)")
     except Exception as e:
         fail(f"Cache could not be read: {e}")
+
+    # --- quota status ---
+    quota = load_quota_state()
+    if quota["remaining"] is not None:
+        msg = f"AbuseIPDB quota: {quota['remaining']}/{quota['limit']} remaining today"
+        eta = estimate_quota_exhaustion(quota)
+        if eta:
+            msg += f" — at the current rate, may run out around {eta.strftime('%H:%M UTC')}"
+        if quota["remaining"] <= QUOTA_WARN_THRESHOLD:
+            warn(msg)
+        else:
+            ok(msg)
+    else:
+        skip("AbuseIPDB quota: unknown (no report sent yet since the last quota reset)")
 
     # --- network reachability ---
     if check_network:
@@ -2968,7 +3312,25 @@ def parse_args():
     parser.add_argument(
         "--json",
         action="store_true",
-        help="With --stats, print machine-readable JSON instead of the human-readable summary.",
+        help="With --stats or --simulate, print machine-readable JSON instead of the "
+             "human-readable summary.",
+    )
+    parser.add_argument(
+        "--simulate",
+        metavar="CATEGORIES", default=None,
+        help="Preview how a given comma-separated AbuseIPDB categories string (e.g. '15,18', "
+             "exactly what CrowdSec's HTTP notification plugin would send) would be handled: "
+             "the severity it maps to, which report window applies and why, and whether it "
+             "would currently be held back by quota reservation. Doesn't send anything or "
+             "need a real IP — for testing a severity/window/quota-reserve config change "
+             "before it goes live. Combine with --simulate-comment to also preview comment "
+             "scrubbing.",
+    )
+    parser.add_argument(
+        "--simulate-comment",
+        metavar="TEXT", default=None,
+        help="With --simulate, also show what this comment would look like after "
+             "ABUSEIPDB_COMMENT_SCRUB_PATTERNS is applied.",
     )
     parser.add_argument(
         "--reconcile",
@@ -3012,6 +3374,14 @@ if __name__ == "__main__":
             print(json.dumps(stats, indent=2))
         else:
             print(format_stats_text(stats))
+        sys.exit(0)
+
+    if args.simulate is not None:
+        result = simulate_alert(args.simulate, comment=args.simulate_comment)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print(format_simulate_text(result))
         sys.exit(0)
 
     if args.export is not None:
@@ -3177,4 +3547,29 @@ if __name__ == "__main__":
     http.server.ThreadingHTTPServer.request_queue_size = 128
     server = http.server.ThreadingHTTPServer((LISTEN_ADDRESS, LISTEN_PORT), AbuseIPDBHandler)
     log(f"Listening on {LISTEN_ADDRESS}:{LISTEN_PORT}.", address=LISTEN_ADDRESS, port=LISTEN_PORT)
+
+    # Graceful shutdown: previously SIGTERM had no handler at all, so
+    # `systemctl stop`/a container stop just killed the process outright --
+    # not data-unsafe (every persisted write is committed immediately, no
+    # buffered state), but in-flight requests got dropped with no response
+    # and there was no way to tell systemd "this is a clean stop" versus
+    # "it crashed". server.shutdown() must be called from a different
+    # thread than the one blocked in serve_forever() -- it works by
+    # setting a flag serve_forever()'s loop notices on its next poll and
+    # then blocks until that loop actually exits, so calling it from
+    # *inside* the signal handler on the same (main) thread that's
+    # currently blocked in serve_forever() would deadlock.
+    def _handle_shutdown_signal(signum, frame):
+        _sd_notify("STOPPING=1")
+        log(f"Received signal {signum}, shutting down...")
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+    signal.signal(signal.SIGINT, _handle_shutdown_signal)
+
+    # Only meaningful under a Type=notify systemd unit (see _sd_notify's
+    # docstring) -- tells systemd the service is actually up and done
+    # resuming any outstanding pending/retry state, not just that the
+    # process has started. A no-op everywhere else.
+    _sd_notify("READY=1")
     server.serve_forever()
