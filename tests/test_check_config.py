@@ -203,3 +203,35 @@ def test_cli_check_config_respects_dry_run_flag_not_just_env_var(tmp_path):
     result = run("--check-config", "--dry-run", env=env)
     assert "not required" in result.stdout
     assert result.returncode == 0
+
+
+# --- Category ID validation --------------------------------------------
+
+def test_default_reconcile_categories_are_ok(proxy):
+    results = proxy.check_config()
+    assert any(level == "ok" and "RECONCILE_CATEGORIES" in msg for level, msg in results)
+
+
+def test_typo_d_reconcile_category_warns(make_proxy):
+    p = make_proxy(ABUSEIPDB_RECONCILE_CATEGORIES="15,999")
+    results = p.check_config()
+    assert any(level == "warn" and "999" in msg for level, msg in results)
+
+
+def test_valid_report_window_category_is_ok(make_proxy):
+    p = make_proxy(ABUSEIPDB_REPORT_WINDOW_CATEGORIES="18=600")
+    results = p.check_config()
+    assert any(level == "ok" and "REPORT_WINDOW_CATEGORIES" in msg for level, msg in results)
+
+
+def test_typo_d_report_window_category_warns(make_proxy):
+    p = make_proxy(ABUSEIPDB_REPORT_WINDOW_CATEGORIES="999=600")
+    results = p.check_config()
+    assert any(level == "warn" and "999" in msg for level, msg in results)
+
+
+def test_no_report_window_categories_configured_is_silent(proxy):
+    # No override configured at all -- nothing to validate, no message
+    # about it either way.
+    results = proxy.check_config()
+    assert not any("REPORT_WINDOW_CATEGORIES" in msg for _level, msg in results)

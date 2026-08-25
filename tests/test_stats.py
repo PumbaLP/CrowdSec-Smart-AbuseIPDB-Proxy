@@ -84,7 +84,7 @@ def test_pending_and_retries_are_included(proxy):
 
 def test_quota_unknown_when_never_updated(proxy):
     stats = proxy.build_stats()
-    assert stats["abuseipdb_quota"] == {"limit": None, "remaining": None, "updated_at": None}
+    assert stats["abuseipdb_quota"] == {"limit": None, "remaining": None, "updated_at": None, "day": None, "day_start_remaining": None, "day_start_time": None}
 
 
 def test_quota_reflects_the_persisted_sidecar_file(proxy):
@@ -103,7 +103,7 @@ def test_quota_survives_a_fresh_module_reimport(make_proxy, tmp_path):
     p1._update_quota_from_headers({"X-RateLimit-Limit": "1000", "X-RateLimit-Remaining": "42"})
 
     p2 = make_proxy(ABUSEIPDB_CACHE_BACKEND="sqlite", ABUSEIPDB_CACHE_FILE=str(db_path))
-    assert p2.quota_state == {"limit": None, "remaining": None, "updated_at": None}  # fresh in-memory state
+    assert p2.quota_state == {"limit": None, "remaining": None, "updated_at": None, "day": None, "day_start_remaining": None, "day_start_time": None}  # fresh in-memory state
     assert p2.load_quota_state()["remaining"] == 42  # but the persisted snapshot is there
 
 
@@ -116,13 +116,13 @@ def test_quota_sidecar_write_failure_does_not_raise(proxy, tmp_path, monkeypatch
 
 
 def test_load_quota_state_tolerates_a_missing_file(proxy):
-    assert proxy.load_quota_state() == {"limit": None, "remaining": None, "updated_at": None}
+    assert proxy.load_quota_state() == {"limit": None, "remaining": None, "updated_at": None, "day": None, "day_start_remaining": None, "day_start_time": None}
 
 
 def test_load_quota_state_tolerates_a_corrupt_file(proxy):
     with open(proxy.QUOTA_STATE_FILE, "w") as f:
         f.write("{not valid json")
-    assert proxy.load_quota_state() == {"limit": None, "remaining": None, "updated_at": None}
+    assert proxy.load_quota_state() == {"limit": None, "remaining": None, "updated_at": None, "day": None, "day_start_remaining": None, "day_start_time": None}
 
 
 # --- format_stats_text() ----------------------------------------------------

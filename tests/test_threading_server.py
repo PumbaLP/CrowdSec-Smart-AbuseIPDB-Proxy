@@ -280,3 +280,15 @@ def test_non_string_ip_field_is_rejected_not_silently_coerced(running_server):
     # 16909060 decodes to 1.2.3.4 -- confirm THAT never got reported either.
     assert "1.2.3.4" not in p.load_cache()["reports"]
     assert p.load_cache()["reports"] == {}
+
+
+def test_health_endpoint_reports_oldest_entry_ages(running_server):
+    p, base_url = running_server(ABUSEIPDB_ENABLE_HEALTH="true")
+    p._sqlite_upsert_pending("1.2.3.4", due_time=999999999999, severity=1, categories="14", comment="x")
+
+    with urllib.request.urlopen(base_url + "/health", timeout=5) as resp:
+        data = json.loads(resp.read())
+
+    assert data["oldest_pending_escalation_age_seconds"] is not None
+    assert data["oldest_pending_escalation_age_seconds"] < 20
+    assert data["oldest_pending_retry_age_seconds"] is None

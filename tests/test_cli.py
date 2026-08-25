@@ -50,3 +50,41 @@ def test_notify_priority_rejects_invalid_choice():
     result = run("--notify", "hi", "--notify-priority", "urgent")
     assert result.returncode == 2
     assert "invalid choice" in result.stderr
+
+
+def test_simulate_flag_prints_human_readable_summary(tmp_path, proxy):
+    result = run("--simulate", "15,18",
+                  env={**__import__("os").environ, "ABUSEIPDB_CACHE_FILE": str(tmp_path / "cache.db")})
+    assert result.returncode == 0
+    assert "Derived severity: 3" in result.stdout
+    assert "Hacking" in result.stdout
+
+
+def test_simulate_flag_with_json_output(tmp_path):
+    import os
+    result = run("--simulate", "14", "--json",
+                  env={**os.environ, "ABUSEIPDB_CACHE_FILE": str(tmp_path / "cache.db")})
+    assert result.returncode == 0
+    import json as jsonlib
+    parsed = jsonlib.loads(result.stdout)
+    assert parsed["severity"] == 1
+    assert parsed["categories"] == ["14"]
+
+
+def test_simulate_flag_does_not_require_an_api_key(tmp_path):
+    import os
+    env = {k: v for k, v in os.environ.items() if not k.startswith("ABUSEIPDB_")}
+    env["ABUSEIPDB_CACHE_FILE"] = str(tmp_path / "cache.db")
+    result = run("--simulate", "15", env=env)
+    assert result.returncode == 0
+
+
+def test_simulate_comment_flag_previews_scrubbing(tmp_path):
+    import os
+    env = {**os.environ,
+           "ABUSEIPDB_CACHE_FILE": str(tmp_path / "cache.db"),
+           "ABUSEIPDB_COMMENT_SCRUB_PATTERNS": r"\d+\.\d+\.\d+\.\d+"}
+    result = run("--simulate", "15", "--simulate-comment", "from 10.0.0.5", env=env)
+    assert result.returncode == 0
+    assert "10.0.0.5" in result.stdout  # the "as given" line
+    assert "[redacted]" in result.stdout  # the "after scrubbing" line

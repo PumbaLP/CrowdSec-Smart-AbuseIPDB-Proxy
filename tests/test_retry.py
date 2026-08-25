@@ -335,3 +335,104 @@ def test_reap_is_a_noop_when_everything_already_has_a_live_timer(proxy, fake_tim
     # No pending/retry rows at all -> nothing to do, no timers created.
     proxy._reap_orphaned_timers()
     assert fake_timer.instances == []
+
+
+# --- Sustained pending/retry backlog warning -------------------------------
+
+class TestRetryBacklogWarning:
+    def test_no_warning_below_the_size_threshold(self, make_proxy, monkeypatch):
+        p = make_proxy(ABUSEIPDB_RETRY_BACKLOG_WARN_SIZE="5", ABUSEIPDB_RETRY_BACKLOG_WARN_AGE="0")
+        calls = []
+        monkeypatch.setattr(p, "notify", lambda msg, priority="high": calls.append(msg))
+
+        p._check_retry_backlog(pending_count=2, retry_count=2)  # 4 < 5
+
+        assert calls == []
+
+    def test_no_warning_until_the_age_threshold_is_reached(self, make_proxy, monkeypatch):
+        p = make_proxy(ABUSEIPDB_RETRY_BACKLOG_WARN_SIZE="5", ABUSEIPDB_RETRY_BACKLOG_WARN_AGE="900")
+        calls = []
+        monkeypatch.setattr(p, "notify", lambda msg, priority="high": calls.append(msg))
+
+        p._check_retry_backlog(pending_count=3, retry_count=3)  # first time crossing -> just starts the clock
+        assert calls == []
+
+        p._check_retry_backlog(pending_count=3, retry_count=3)  # still "now" in test time, age ~0s
+        assert calls == []  # age threshold (900s) not reached yet
+
+    def test_warns_once_the_age_threshold_is_reached(self, make_proxy, monkeypatch):
+        p = make_proxy(ABUSEIPDB_RETRY_BACKLOG_WARN_SIZE="5", ABUSEIPDB_RETRY_BACKLOG_WARN_AGE="900")
+        calls = []
+        monkeypatch.setattr(p, "notify", lambda msg, priority="high": calls.append(msg))
+
+        p._check_retry_backlog(pending_count=3, retry_count=3)  # starts the clock
+        p._backlog_over_threshold_since -= 1000  # simulate 1000s having elapsed
+
+        p._check_retry_backlog(pending_count=3, retry_count=3)
+
+        assert len(calls) == 1
+        assert "6" in calls[0]  # combined count mentioned
+
+    def test_does_not_warn_twice_for_the_same_continuous_episode(self, make_proxy, monkeypatch):
+        p = make_proxy(ABUSEIPDB_RETRY_BACKLOG_WARN_SIZE="5", ABUSEIPDB_RETRY_BACKLOG_WARN_AGE="900")
+        calls = []
+        monkeypatch.setattr(p, "notify", lambda msg, priority="high": calls.append(msg))
+
+        p._check_retry_backlog(pending_count=3, retry_count=3)
+        p._backlog_over_threshold_since -= 1000
+        p._check_retry_backlog(pending_count=3, retry_count=3)
+        p._check_retry_backlog(pending_count=3, retry_count=3)  # still backlogged, already warned
+        p._check_retry_backlog(pending_count=10, retry_count=10)  # even worse, still same episode
+
+        assert len(calls) == 1
+
+    def test_dropping_below_threshold_resets_the_episode_for_a_fresh_warning(self, make_proxy, monkeypatch):
+        p = make_proxy(ABUSEIPDB_RETRY_BACKLOG_WARN_SIZE="5", ABUSEIPDB_RETRY_BACKLOG_WARN_AGE="900")
+        calls = []
+        monkeypatch.setattr(p, "notify", lambda msg, priority="high": calls.append(msg))
+
+        p._check_retry_backlog(pending_count=3, retry_count=3)
+        p._backlog_over_threshold_since -= 1000
+        p._check_retry_backlog(pending_count=3, retry_count=3)
+        assert len(calls) == 1
+
+        p._check_retry_backlog(pending_count=0, retry_count=0)  # drains back to normal
+        assert p._backlog_over_threshold_since is None
+        assert p._backlog_warned is False
+
+        # A second, later episode must get its own warning, not stay
+        # silently suppressed by the first one having already fired.
+        p._check_retry_backlog(pending_count=3, retry_count=3)
+        p._backlog_over_threshold_since -= 1000
+        p._check_retry_backlog(pending_count=3, retry_count=3)
+        assert len(calls) == 2
+
+    def test_zero_size_disables_the_feature_entirely(self, make_proxy, monkeypatch):
+        p = make_proxy(ABUSEIPDB_RETRY_BACKLOG_WARN_SIZE="0")
+        calls = []
+        monkeypatch.setattr(p, "notify", lambda msg, priority="high": calls.append(msg))
+
+        p._check_retry_backlog(pending_count=1000, retry_count=1000)
+
+        assert calls == []
+        assert p._backlog_over_threshold_since is None
+
+    def test_reap_orphaned_timers_feeds_the_backlog_check(self, proxy, fake_timer, monkeypatch):
+        # End-to-end: _reap_orphaned_timers() (the periodic loop's actual
+        # entry point) must pass its own pending/retry counts through to
+        # the backlog check, not just leave it dangling and unused.
+        proxy.RETRY_BACKLOG_WARN_SIZE = 1
+        proxy.RETRY_BACKLOG_WARN_AGE = 0
+        calls = []
+        monkeypatch.setattr(proxy, "notify", lambda msg, priority="high": calls.append(msg))
+        proxy.save_cache({
+            "reports": {},
+            "pending": {"1.2.3.4": {"due_time": 999999999999, "severity": 1, "categories": "14", "comment": "x"}},
+            "retry_queue": {},
+        })
+
+        proxy._reap_orphaned_timers()  # starts the clock (episode begins)
+        proxy._backlog_over_threshold_since -= 10
+        proxy._reap_orphaned_timers()  # age now exceeds the 0s threshold
+
+        assert len(calls) == 1

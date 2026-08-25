@@ -348,3 +348,30 @@ def test_live_self_test_end_to_end_against_a_real_running_server(running_server)
     assert "192.0.2.1" not in p.load_cache()["reports"]  # never actually reported
     with p.metrics_lock:
         assert p.metrics.get("reports_ignored_private_total", 0) == 1
+
+
+def test_quota_unknown_reports_skip(proxy):
+    results = proxy.run_doctor(check_network=False)
+    assert any(level == "skip" and "quota" in msg.lower() for level, msg in results)
+
+
+def test_quota_comfortable_reports_ok(proxy):
+    proxy._update_quota_from_headers({"X-RateLimit-Limit": "1000", "X-RateLimit-Remaining": "500"})
+    results = proxy.run_doctor(check_network=False)
+    assert any(level == "ok" and "500/1000" in msg for level, msg in results)
+
+
+def test_quota_low_reports_warn(proxy):
+    proxy._update_quota_from_headers({"X-RateLimit-Limit": "1000", "X-RateLimit-Remaining": "10"})
+    results = proxy.run_doctor(check_network=False)
+    assert any(level == "warn" and "10/1000" in msg for level, msg in results)
+
+
+def test_quota_includes_eta_when_projectable(proxy):
+    proxy._update_quota_from_headers({"X-RateLimit-Limit": "1000", "X-RateLimit-Remaining": "1000"})
+    proxy.quota_state["day_start_time"] -= 600
+    proxy._update_quota_from_headers({"X-RateLimit-Limit": "1000", "X-RateLimit-Remaining": "900"})
+
+    results = proxy.run_doctor(check_network=False)
+
+    assert any("run out around" in msg for _, msg in results)
