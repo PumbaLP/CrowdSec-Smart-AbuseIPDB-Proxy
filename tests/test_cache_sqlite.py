@@ -101,7 +101,59 @@ def test_save_then_load_round_trips(sqlite_proxy):
                                      "comment": "brute-force", "attempts": 2}},
     }
     sqlite_proxy.save_cache(cache)
-    assert sqlite_proxy.load_cache() == cache
+    loaded = sqlite_proxy.load_cache()
+    assert loaded["reports"] == cache["reports"]
+    # save_cache() didn't receive a created_at for these (a caller
+    # building the dict by hand, same as this test) -- it must fall back
+    # to "now" rather than persisting NULL, and load_cache() must then
+    # round-trip that fallback value back out.
+    assert loaded["pending"]["5.6.7.8"]["created_at"] is not None
+    assert loaded["retry_queue"]["9.9.9.9"]["created_at"] is not None
+    for key in ("due_time", "severity", "categories", "comment"):
+        assert loaded["pending"]["5.6.7.8"][key] == cache["pending"]["5.6.7.8"][key]
+    for key in ("due_time", "categories", "comment", "attempts"):
+        assert loaded["retry_queue"]["9.9.9.9"][key] == cache["retry_queue"]["9.9.9.9"][key]
+
+
+def test_save_then_load_round_trips_an_explicit_created_at(sqlite_proxy):
+    # When the caller DOES supply created_at (e.g. re-importing a backup,
+    # or load_cache()'s own output being fed straight back to
+    # save_cache()), that value must be preserved, not silently
+    # overwritten with "now" -- the "now" fallback above is specifically
+    # for when it's *missing*, not a blanket reset on every save.
+    cache = {
+        "reports": {},
+        "pending": {"5.6.7.8": {"due_time": 2000, "severity": 3,
+                                 "categories": "15", "comment": "hacking",
+                                 "created_at": 500}},
+        "retry_queue": {"9.9.9.9": {"due_time": 3000, "categories": "18",
+                                     "comment": "brute-force", "attempts": 2,
+                                     "created_at": 600}},
+    }
+    sqlite_proxy.save_cache(cache)
+    loaded = sqlite_proxy.load_cache()
+    assert loaded["pending"]["5.6.7.8"]["created_at"] == 500
+    assert loaded["retry_queue"]["9.9.9.9"]["created_at"] == 600
+
+
+def test_vacuum_preserves_created_at_for_surviving_pending_retry_rows(sqlite_proxy):
+    # Regression test: vacuum_cache() (and --backup/--import, anything
+    # going through the bulk load_cache()+save_cache() round trip rather
+    # than the per-alert single-row helpers) used to silently NULL out
+    # every pending/retry row's created_at on every single call, quietly
+    # resetting /health's age tracking for anything that survived a
+    # vacuum run -- confirmed by first reproducing this against the
+    # unfixed code before writing this test.
+    sqlite_proxy._sqlite_upsert_pending("1.2.3.4", due_time=999999999999, severity=1,
+                                         categories="14", comment="x")
+    age_before = sqlite_proxy._oldest_entry_age("pending")
+    assert age_before is not None
+
+    sqlite_proxy.vacuum_cache()
+
+    age_after = sqlite_proxy._oldest_entry_age("pending")
+    assert age_after is not None
+    assert age_after < 5  # still a real, recent timestamp -- not None/reset
 
 
 def test_save_replaces_previous_contents_entirely(sqlite_proxy):
@@ -191,8 +243,14 @@ class TestJsonToSqliteMigration:
         cache = p.load_cache()
 
         assert cache["reports"] == {"1.2.3.4": {"time": 1000, "severity": 2}}
-        assert cache["pending"] == {"5.6.7.8": {"due_time": 2000, "severity": 3,
-                                                  "categories": "15", "comment": "hacking"}}
+        entry = cache["pending"]["5.6.7.8"]
+        assert entry["due_time"] == 2000
+        assert entry["severity"] == 3
+        assert entry["categories"] == "15"
+        assert entry["comment"] == "hacking"
+        # Legacy JSON predates created_at -- must fall back to "now"
+        # rather than staying NULL/missing when migrated into SQLite.
+        assert entry["created_at"] is not None
 
     def test_legacy_v1_0_0_flat_format_is_also_migrated(self, make_proxy, tmp_path):
         import json as jsonlib
@@ -355,9 +413,12 @@ def test_sqlite_upsert_report_overwrites_existing_row(sqlite_proxy):
 def test_sqlite_upsert_pending_and_delete(sqlite_proxy):
     sqlite_proxy._sqlite_upsert_pending("5.6.7.8", 2000, 3, "18", "x")
     cache = sqlite_proxy.load_cache()
-    assert cache["pending"]["5.6.7.8"] == {
-        "due_time": 2000, "severity": 3, "categories": "18", "comment": "x",
-    }
+    entry = cache["pending"]["5.6.7.8"]
+    assert entry["due_time"] == 2000
+    assert entry["severity"] == 3
+    assert entry["categories"] == "18"
+    assert entry["comment"] == "x"
+    assert entry["created_at"] is not None
     sqlite_proxy._sqlite_delete_pending("5.6.7.8")
     assert "5.6.7.8" not in sqlite_proxy.load_cache()["pending"]
 
@@ -369,9 +430,12 @@ def test_sqlite_delete_pending_missing_ip_is_a_silent_no_op(sqlite_proxy):
 def test_sqlite_upsert_retry_and_delete(sqlite_proxy):
     sqlite_proxy._sqlite_upsert_retry("1.1.1.1", 3000, "15", "y", 2)
     cache = sqlite_proxy.load_cache()
-    assert cache["retry_queue"]["1.1.1.1"] == {
-        "due_time": 3000, "categories": "15", "comment": "y", "attempts": 2,
-    }
+    entry = cache["retry_queue"]["1.1.1.1"]
+    assert entry["due_time"] == 3000
+    assert entry["categories"] == "15"
+    assert entry["comment"] == "y"
+    assert entry["attempts"] == 2
+    assert entry["created_at"] is not None
     sqlite_proxy._sqlite_delete_retry("1.1.1.1")
     assert "1.1.1.1" not in sqlite_proxy.load_cache()["retry_queue"]
 

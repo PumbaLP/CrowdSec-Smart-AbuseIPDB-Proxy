@@ -180,6 +180,39 @@ def test_metrics_omit_quota_gauges_when_unknown(proxy):
 
 
 class TestQuotaExhaustionEstimate:
+    def test_no_estimate_when_the_baseline_day_is_stale(self, proxy):
+        # A quota_state that hasn't been updated in days (a dead API key,
+        # DNS failure, or the proxy being down entirely -- no successful
+        # response headers means _update_quota_from_headers() never runs
+        # to refresh "day") still carries whatever "day"/"day_start_*"
+        # were last persisted. --stats/--doctor/--simulate read that
+        # stale snapshot as a separate process with no way to know it's
+        # stale on their own -- exactly the situation someone reaching
+        # for --doctor to diagnose a broken proxy is most likely to be
+        # in. Projecting "today's rate" from a multi-day-old baseline
+        # must not happen; this must return None instead of a
+        # confidently-wrong ETA.
+        stale_quota = {
+            "remaining": 950,
+            "day": "2000-01-01",
+            "day_start_remaining": 1000,
+            "day_start_time": proxy.time.time() - 10 * 86400,
+        }
+        assert proxy.estimate_quota_exhaustion(stale_quota) is None
+
+    def test_estimate_is_made_when_the_baseline_day_is_today(self, proxy):
+        # Sanity check alongside the staleness test above: a *correctly*
+        # same-day baseline must still produce a projection, so the fix
+        # for the staleness bug didn't accidentally break the normal case.
+        today = proxy.datetime.now(proxy.timezone.utc).date().isoformat()
+        fresh_quota = {
+            "remaining": 900,
+            "day": today,
+            "day_start_remaining": 1000,
+            "day_start_time": proxy.time.time() - 600,
+        }
+        assert proxy.estimate_quota_exhaustion(fresh_quota) is not None
+
     def test_no_estimate_without_enough_elapsed_time(self, proxy):
         proxy._update_quota_from_headers(FakeHeaders({"X-RateLimit-Limit": "1000", "X-RateLimit-Remaining": "900"}))
         proxy._update_quota_from_headers(FakeHeaders({"X-RateLimit-Limit": "1000", "X-RateLimit-Remaining": "890"}))

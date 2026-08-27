@@ -123,6 +123,34 @@ def test_does_not_touch_unrelated_files_in_the_backup_dir(proxy, tmp_path):
     assert (backup_dir / "readme.txt").exists()
 
 
+def test_two_backups_within_the_same_second_do_not_overwrite_each_other(proxy, tmp_path, monkeypatch):
+    # The timestamp-based filename only has 1-second resolution -- freeze
+    # "now" so both calls land on the exact same second (simulating two
+    # back-to-back invocations), and confirm the second one gets a
+    # distinct filename rather than silently clobbering the first backup.
+    fixed_now = proxy.datetime(2026, 1, 1, 12, 0, 0, tzinfo=proxy.timezone.utc)
+
+    class FrozenDatetime(proxy.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now
+
+    monkeypatch.setattr(proxy, "datetime", FrozenDatetime)
+    backup_dir = str(tmp_path / "backups")
+
+    first = proxy.run_backup(backup_dir=backup_dir)
+    proxy.save_cache({"reports": {"1.2.3.4": {"time": 1, "severity": 1}}, "pending": {}, "retry_queue": {}})
+    second = proxy.run_backup(backup_dir=backup_dir)
+
+    assert first["backup_path"] != second["backup_path"]
+    assert os.path.exists(first["backup_path"])
+    assert os.path.exists(second["backup_path"])
+    # And the first backup's content wasn't clobbered by the second's.
+    with open(first["backup_path"]) as f:
+        first_content = f.read()
+    assert "1.2.3.4" not in first_content
+
+
 def test_logs_the_backup_path(proxy, capsys):
     result = proxy.run_backup()
     captured = capsys.readouterr()

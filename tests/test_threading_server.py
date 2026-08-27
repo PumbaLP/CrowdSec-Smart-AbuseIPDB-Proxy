@@ -126,11 +126,14 @@ def test_server_survives_malformed_concurrent_requests(running_server):
     assert status == 200
 
 
-def test_malformed_content_length_header_gets_a_clean_500(running_server):
+def test_malformed_content_length_header_gets_a_clean_400(running_server):
     """Regression test: int(Content-Length) used to run outside the
     try/except, so a garbage header value (as opposed to a garbage body,
     which was already handled) would raise unhandled instead of getting
-    the same clean 500 response every other malformed-input case gets."""
+    a clean response. Now explicitly caught and treated as invalid
+    (same path as a negative Content-Length -- see the dedicated hang
+    regression test below), returning a clean 400 rather than the
+    generic 500 every other malformed-*body* case still gets."""
     p, base_url = running_server()
     port = int(base_url.rsplit(":", 1)[1])
 
@@ -144,7 +147,7 @@ def test_malformed_content_length_header_gets_a_clean_500(running_server):
     resp.read()
     conn.close()
 
-    assert status == 500
+    assert status == 400
 
     # server must still be healthy afterwards
     status2, _ = _post(base_url, "1.2.3.201")
@@ -292,3 +295,66 @@ def test_health_endpoint_reports_oldest_entry_ages(running_server):
     assert data["oldest_pending_escalation_age_seconds"] is not None
     assert data["oldest_pending_escalation_age_seconds"] < 20
     assert data["oldest_pending_retry_age_seconds"] is None
+
+
+def test_negative_content_length_does_not_hang_the_worker_thread(running_server):
+    """
+    Regression test for a real, reproducible hang: BufferedReader.read(n)
+    for n < 0 means "read until EOF", which on a live socket blocks until
+    the *client* closes the connection. A "Content-Length: -1" header
+    used to reach rfile.read(-1) directly -- a client that just keeps the
+    connection open (accidentally or deliberately) hung that worker
+    thread forever, permanently consuming one MAX_CONCURRENT_REQUESTS
+    slot per such request (the semaphore is only released in do_POST()'s
+    `finally`, which never runs for a thread that never returns).
+    Confirmed first against the unfixed code with a real socket before
+    this was written: a 5s recv() timed out with no response at all.
+    """
+    import socket
+    p, base_url = running_server()
+    port = int(base_url.rsplit(":", 1)[1])
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(5)
+    try:
+        s.connect(("127.0.0.1", port))
+        s.sendall(
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+            b"Content-Length: -1\r\n\r\n"
+        )
+        # Deliberately NOT closing the connection here -- that's exactly
+        # the condition that used to cause the hang (rfile.read(-1)
+        # waiting for EOF that a well-behaved client would eventually
+        # provide by closing, but nothing forces a client to).
+        response = s.recv(4096)
+    finally:
+        s.close()
+
+    assert b"400" in response.split(b"\r\n", 1)[0]
+
+
+def test_server_remains_responsive_after_a_negative_content_length_request(running_server):
+    # Belt-and-suspenders: after the malformed request above, a normal
+    # request must still get served promptly -- confirms the fix didn't
+    # just avoid a crash while still leaking the concurrency slot some
+    # other way.
+    p, base_url = running_server()
+    status, _ = _post(base_url, "192.0.2.1")
+    assert status == 200
+
+
+def test_oversized_content_length_is_rejected_without_reading_the_body(running_server):
+    p, base_url = running_server()
+    port = int(base_url.rsplit(":", 1)[1])
+
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.putrequest("POST", "/")
+    conn.putheader("Content-Length", str(p.MAX_REQUEST_BODY_BYTES + 1))
+    conn.endheaders()
+    resp = conn.getresponse()
+    status = resp.status
+    resp.read()
+    conn.close()
+
+    assert status == 400
