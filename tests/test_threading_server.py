@@ -157,12 +157,27 @@ def test_malformed_content_length_header_gets_a_clean_400(running_server):
 def test_max_concurrent_requests_rejects_with_503_over_the_limit(running_server):
     p, base_url = running_server(ABUSEIPDB_MAX_CONCURRENT_REQUESTS="3")
 
-    # hold the semaphore open with slow in-flight requests, then confirm
-    # a request over the limit gets a clean 503 instead of queuing forever
+    # Hold the semaphore open with slow in-flight requests, then confirm
+    # a request over the limit gets a clean 503 instead of queuing
+    # forever. Previously used a fixed `time.sleep(0.3)` as a guess for
+    # "enough time for the first 3 requests to actually occupy the
+    # semaphore" -- under enough system load (observed under coverage.py
+    # instrumentation specifically) that margin could occasionally not be
+    # enough, sending the overflow request before all 3 had truly
+    # acquired their slot and letting it grab one meant for a "held"
+    # request instead. Replaced with a counter + Event so the test
+    # deterministically waits for confirmation that all 3 are actually
+    # blocked, rather than guessing a duration.
+    entered_count = {"n": 0}
+    entered_lock = threading.Lock()
+    all_entered = threading.Event()
     release_event = threading.Event()
-    original_whitelisted = p.is_whitelisted
 
     def blocking_check(ip):
+        with entered_lock:
+            entered_count["n"] += 1
+            if entered_count["n"] >= 3:
+                all_entered.set()
         release_event.wait(timeout=5)
         return False
 
@@ -183,7 +198,7 @@ def test_max_concurrent_requests_rejects_with_503_over_the_limit(running_server)
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = [pool.submit(slow_post, i) for i in range(3)]
-        time.sleep(0.3)  # let the first 3 actually occupy the semaphore
+        assert all_entered.wait(timeout=5), "the 3 holding requests never all reached the semaphore in time"
         overflow_status = None
         try:
             overflow_status, _ = _post(base_url, "203.0.200.99")
