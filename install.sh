@@ -64,13 +64,30 @@ fi
 
 if [[ -n "${EXISTING_KEY}" ]]; then
     echo "An API key was already found under ${ENV_PATH}."
-    read -r -p "Keep the existing key? [Y/n] " KEEP_KEY
-    KEEP_KEY="${KEEP_KEY:-Y}"
+    if [[ -t 0 ]]; then
+        read -r -p "Keep the existing key? [Y/n] " KEEP_KEY
+        KEEP_KEY="${KEEP_KEY:-Y}"
+    else
+        # A plain `read` here with no input available (stdin closed/empty,
+        # e.g. this script invoked from a cron job, a systemd service, or
+        # update.sh's own `--yes` auto-update path) returns non-zero at
+        # EOF -- under `set -e` that silently killed the whole install
+        # with no explanation beyond "An API key was already found...".
+        # Matches the prompt's own interactive default ([Y/n] -> Y).
+        echo "Non-interactive run detected -- keeping the existing key."
+        KEEP_KEY="Y"
+    fi
 fi
 
 if [[ "${KEEP_KEY:-n}" =~ ^[Yy]$ ]]; then
     API_KEY="${EXISTING_KEY}"
 else
+    if [[ ! -t 0 ]]; then
+        echo "Error: no ABUSEIPDB_API_KEY is configured yet, and this isn't an" >&2
+        echo "interactive terminal to prompt for one. Set ABUSEIPDB_API_KEY in" >&2
+        echo "${ENV_PATH} first, then re-run." >&2
+        exit 1
+    fi
     read -r -s -p "Enter your AbuseIPDB API key (input hidden): " API_KEY
     echo
     if [[ -z "${API_KEY}" ]]; then

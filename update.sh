@@ -66,14 +66,21 @@ PYEOF
 }
 
 # Best-effort notification helper for --check-only. Reuses whatever
-# alerting backend (Gotify/ntfy/webhook) is already configured for the
-# proxy itself, via the installed binary's --notify flag. Never fails the
-# script — a missing/unconfigured backend just means no notification.
+# alerting backend (Gotify/ntfy/webhook/...) is already configured for
+# the proxy itself, via the installed binary's --notify flag. Returns
+# the binary's own exit status (0 = a backend was configured and the
+# send was attempted, 1 = no backend configured) rather than swallowing
+# it, so the caller's NOTIFIED/--json "notified" field reflects whether
+# a notification could actually be sent, not just whether this function
+# was reachable at all (the binary being executable says nothing about
+# whether any backend is configured).
 notify_update_available() {
     local msg="$1"
     if [[ -x "${BIN_PATH}" ]]; then
-        "${BIN_PATH}" --notify "${msg}" --notify-priority normal >/dev/null 2>&1 || true
+        "${BIN_PATH}" --notify "${msg}" --notify-priority normal >/dev/null 2>&1
+        return $?
     fi
+    return 1
 }
 
 if [[ ! -d .git ]]; then
@@ -163,14 +170,17 @@ fi
 
 if [[ "${CHECK_ONLY}" == "true" ]]; then
     NOTIFIED="false"
-    [[ -x "${BIN_PATH}" ]] && NOTIFIED="true"
 
     if [[ -n "${NEW_VERSION}" && "${OLD_VERSION}" != "${NEW_VERSION}" ]]; then
         info "Update available: ${OLD_VERSION:-unknown} -> ${NEW_VERSION}"
-        notify_update_available "Update to v${NEW_VERSION} available. Run update.sh to apply it."
+        if notify_update_available "Update to v${NEW_VERSION} available. Run update.sh to apply it."; then
+            NOTIFIED="true"
+        fi
     else
         info "Update available (${COMMIT_COUNT} new commit(s)), no version bump detected."
-        notify_update_available "An update is available (${COMMIT_COUNT} new commit(s)). Run update.sh to apply it."
+        if notify_update_available "An update is available (${COMMIT_COUNT} new commit(s)). Run update.sh to apply it."; then
+            NOTIFIED="true"
+        fi
     fi
     info "Nothing was changed (--check-only). Run without --check-only to apply."
 

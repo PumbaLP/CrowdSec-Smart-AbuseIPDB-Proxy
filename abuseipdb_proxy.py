@@ -31,7 +31,7 @@ import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 
-VERSION = "3.1.0"
+VERSION = "3.1.1"
 
 START_TIME = time.time()
 
@@ -445,6 +445,14 @@ def is_shared_secret_valid(provided):
 # CrowdSec setup should ever produce at once).
 MAX_CONCURRENT_REQUESTS = int(os.getenv("ABUSEIPDB_MAX_CONCURRENT_REQUESTS", "50"))
 _request_semaphore = threading.Semaphore(MAX_CONCURRENT_REQUESTS) if MAX_CONCURRENT_REQUESTS > 0 else None
+
+# A real CrowdSec HTTP-notification-plugin alert body is a few hundred
+# bytes at most (an IP, categories, a short comment) -- this is deliberately
+# generous headroom, not a tuned limit, just a sane upper bound so a
+# malformed or malicious Content-Length can't make a single request buffer
+# an unbounded amount of memory. Not configurable on purpose: raise an
+# issue if a legitimate use case ever needs more than this.
+MAX_REQUEST_BODY_BYTES = 1_000_000
 
 
 # --- Alerting (Gotify / ntfy / Slack / Discord / Matrix / Telegram / -------
@@ -891,9 +899,9 @@ def load_cache():
     {
       "reports": {ip: {"time": epoch, "severity": int}},
       "pending": {ip: {"due_time": epoch, "severity": int,
-                        "categories": str, "comment": str}},
+                        "categories": str, "comment": str, "created_at": epoch}},
       "retry_queue": {ip: {"due_time": epoch, "categories": str,
-                            "comment": str, "attempts": int}}
+                            "comment": str, "attempts": int, "created_at": epoch}}
     }
     """
     return _load_cache_sqlite()
@@ -1070,14 +1078,16 @@ def _load_cache_sqlite():
             for ip, t, s in conn.execute("SELECT ip, time, severity FROM reports")
         }
         pending = {
-            ip: {"due_time": due, "severity": sev, "categories": cats, "comment": comment}
-            for ip, due, sev, cats, comment in
-            conn.execute("SELECT ip, due_time, severity, categories, comment FROM pending")
+            ip: {"due_time": due, "severity": sev, "categories": cats, "comment": comment,
+                 "created_at": created_at}
+            for ip, due, sev, cats, comment, created_at in
+            conn.execute("SELECT ip, due_time, severity, categories, comment, created_at FROM pending")
         }
         retry_queue = {
-            ip: {"due_time": due, "categories": cats, "comment": comment, "attempts": attempts}
-            for ip, due, cats, comment, attempts in
-            conn.execute("SELECT ip, due_time, categories, comment, attempts FROM retry_queue")
+            ip: {"due_time": due, "categories": cats, "comment": comment, "attempts": attempts,
+                 "created_at": created_at}
+            for ip, due, cats, comment, attempts, created_at in
+            conn.execute("SELECT ip, due_time, categories, comment, attempts, created_at FROM retry_queue")
         }
         return {"reports": reports, "pending": pending, "retry_queue": retry_queue}
     finally:
@@ -1096,15 +1106,27 @@ def _save_cache_sqlite(cache, path=None):
                 [(ip, v["time"], v["severity"]) for ip, v in cache.get("reports", {}).items()],
             )
             conn.execute("DELETE FROM pending")
+            # created_at falls back to "now" for an entry that doesn't
+            # carry one -- e.g. a --import of a backup taken before this
+            # field existed, or a dict built by hand (tests, or a future
+            # caller). A full load_cache()+save_cache() round trip (this
+            # is the bulk path used by --vacuum/--backup/--import, not
+            # the per-alert hot path) otherwise used to silently NULL out
+            # every pending/retry row's created_at on every single call,
+            # quietly resetting /health's age tracking for anything that
+            # happened to survive a vacuum run.
+            now_ts = int(time.time())
             conn.executemany(
-                "INSERT INTO pending (ip, due_time, severity, categories, comment) VALUES (?, ?, ?, ?, ?)",
-                [(ip, v["due_time"], v["severity"], v["categories"], v["comment"])
+                "INSERT INTO pending (ip, due_time, severity, categories, comment, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [(ip, v["due_time"], v["severity"], v["categories"], v["comment"], v.get("created_at") or now_ts)
                  for ip, v in cache.get("pending", {}).items()],
             )
             conn.execute("DELETE FROM retry_queue")
             conn.executemany(
-                "INSERT INTO retry_queue (ip, due_time, categories, comment, attempts) VALUES (?, ?, ?, ?, ?)",
-                [(ip, v["due_time"], v["categories"], v["comment"], v["attempts"])
+                "INSERT INTO retry_queue (ip, due_time, categories, comment, attempts, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [(ip, v["due_time"], v["categories"], v["comment"], v["attempts"], v.get("created_at") or now_ts)
                  for ip, v in cache.get("retry_queue", {}).items()],
             )
     finally:
@@ -1412,11 +1434,26 @@ def estimate_quota_exhaustion(quota):
     bug -- which is exactly why this refuses to project at all until at
     least a few minutes and at least one consumed report are behind it,
     rather than returning a wildly noisy number from the very first
-    observation."""
+    observation.
+
+    Also refuses to project if the snapshot's "day" baseline isn't
+    today: a quota_state.json that hasn't been updated in days (the
+    live process stopped receiving any API response headers at all --
+    a dead API key, DNS failure, or the proxy just being down) still
+    has a "day"/"day_start_*" from whenever it was last written. Without
+    this check, --stats/--doctor/--simulate (all of which read that
+    same persisted snapshot as a separate one-off process, with no way
+    of their own to have refreshed it) would silently extrapolate
+    "today's rate" from a baseline that's actually days old -- and
+    that's precisely the situation someone reaching for --doctor to
+    diagnose a broken proxy is most likely to be in, making a
+    confidently-wrong ETA worse than useless right when it matters."""
     remaining = quota.get("remaining")
     day_start_remaining = quota.get("day_start_remaining")
     day_start_time = quota.get("day_start_time")
     if remaining is None or day_start_remaining is None or day_start_time is None:
+        return None
+    if quota.get("day") != datetime.now(timezone.utc).date().isoformat():
         return None
     elapsed = time.time() - day_start_time
     consumed = day_start_remaining - remaining
@@ -2126,7 +2163,29 @@ class AbuseIPDBHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_post(self):
         try:
-            content_length = int(self.headers.get('Content-Length', 0))
+            try:
+                content_length = int(self.headers.get('Content-Length', 0))
+            except ValueError:
+                content_length = -1
+            # A negative Content-Length (e.g. a malformed/malicious
+            # "Content-Length: -1" header) must never reach rfile.read():
+            # BufferedReader.read(n) for n < 0 means "read until EOF",
+            # which on a live socket blocks until the *client* closes the
+            # connection -- a client that just keeps it open (accidentally
+            # or deliberately) hangs this thread forever. Since the
+            # MAX_CONCURRENT_REQUESTS semaphore is only released in
+            # do_POST()'s `finally` after this method returns, a hung
+            # thread here permanently consumes one concurrency slot;
+            # enough of them (as few as MAX_CONCURRENT_REQUESTS requests)
+            # and the proxy stops accepting real CrowdSec alerts entirely.
+            # A real CrowdSec alert body is a few hundred bytes at most,
+            # so this also caps how much a single request can make us
+            # buffer into memory regardless of sign.
+            if content_length < 0 or content_length > MAX_REQUEST_BODY_BYTES:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"Bad Content-Length")
+                return
             body = self.rfile.read(content_length)
 
             data = json.loads(body.decode('utf-8'))
@@ -3043,6 +3102,15 @@ def run_backup(backup_dir=None):
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     backup_path = os.path.join(backup_dir, f"cache-{timestamp}.json")
+    if os.path.exists(backup_path):
+        # The timestamp has only 1-second resolution -- two backups
+        # requested within the same second (back-to-back manual runs, a
+        # script, or a test) would otherwise silently overwrite each
+        # other instead of producing two separate backups.
+        suffix = 2
+        while os.path.exists(backup_path):
+            backup_path = os.path.join(backup_dir, f"cache-{timestamp}-{suffix}.json")
+            suffix += 1
     with open(backup_path, "w") as f:
         f.write(export_cache_json())
 
