@@ -35,6 +35,25 @@ jobs:
           systemd-analyze verify abuseipdb-proxy-backup.service abuseipdb-proxy-backup.timer || true
           systemd-analyze verify abuseipdb-proxy-reconcile.service abuseipdb-proxy-reconcile.timer || true
 
+  shell-scripts:
+    # Separate from `lint` above (which only checks syntax/style) because
+    # these are *behavioral* regression tests for install.sh/update.sh --
+    # two real bugs (see CHANGELOG 3.1.1) that ShellCheck couldn't have
+    # caught, since both were about runtime behavior (a silent
+    # non-interactive abort, a misleading reported outcome) rather than
+    # anything ShellCheck statically analyzes. Neither is testable from
+    # the Python suite either, since they're pure shell-script behavior.
+    # Runs as root (these scripts install to /etc, /usr/local/bin,
+    # /var/lib, /etc/systemd/system) on an otherwise-disposable runner --
+    # never run this script against a real proxy host.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run install.sh / update.sh behavioral regression tests
+        run: sudo bash .github/scripts/test_shell_scripts.sh
+
   test:
     runs-on: ubuntu-latest
     steps:
