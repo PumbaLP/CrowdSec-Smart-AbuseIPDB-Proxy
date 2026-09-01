@@ -31,7 +31,7 @@ import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 
-VERSION = "3.1.1"
+VERSION = "3.2.0"
 
 START_TIME = time.time()
 
@@ -154,6 +154,26 @@ API_KEY = _get_secret("ABUSEIPDB_API_KEY") or None
 # expects from a service's own logging.
 LOG_FORMAT = os.getenv("ABUSEIPDB_LOG_FORMAT", "text").strip().lower()
 
+# Optional hostname/instance tag added to every JSON log line (no effect
+# on "text" format, which is normally read locally via `journalctl` on
+# the host it's already running on). Off by default -- a single-instance
+# deployment has no use for it, and it would just be one more field to
+# ignore. Useful once you're running this proxy at more than one
+# site/host and shipping ABUSEIPDB_LOG_FORMAT=json output to a shared
+# log aggregator (Loki, ELK, Graylog), where otherwise there's no way to
+# tell which instance wrote which line without tagging it at the shipper
+# level instead. Set to "true"/"1"/"yes" to auto-detect via
+# socket.gethostname(), or to any other non-empty string to use that
+# literal value instead (e.g. a friendlier site name than the system's
+# actual hostname).
+_log_hostname_setting = os.getenv("ABUSEIPDB_LOG_HOSTNAME", "").strip()
+if _log_hostname_setting.lower() in ("true", "1", "yes"):
+    LOG_HOSTNAME = socket.gethostname()
+elif _log_hostname_setting:
+    LOG_HOSTNAME = _log_hostname_setting
+else:
+    LOG_HOSTNAME = None
+
 
 def log(message, level="info", **fields):
     if LOG_FORMAT == "json":
@@ -162,6 +182,8 @@ def log(message, level="info", **fields):
             "level": level,
             "message": message,
         }
+        if LOG_HOSTNAME:
+            record["hostname"] = LOG_HOSTNAME
         record.update(fields)
         sys.stderr.write(json.dumps(record) + "\n")
     else:
@@ -455,6 +477,66 @@ _request_semaphore = threading.Semaphore(MAX_CONCURRENT_REQUESTS) if MAX_CONCURR
 MAX_REQUEST_BODY_BYTES = 1_000_000
 
 
+# --- Per-source-IP request rate limit ---------------------------------------
+# Complementary to MAX_CONCURRENT_REQUESTS above, which caps total
+# concurrency across every source combined but does nothing to stop one
+# single source from consuming most or all of that shared pool. Mainly
+# relevant for ABUSEIPDB_LISTEN_ADDRESS=0.0.0.0 deployments (documented as
+# an option for Docker) where the endpoint isn't necessarily reachable only
+# from a trusted CrowdSec instance on localhost -- a single misbehaving or
+# malicious source sending many small, individually-valid-looking requests
+# could otherwise starve every other source of concurrency slots. 0 (the
+# default) disables this entirely, matching pre-existing behavior; a real
+# CrowdSec setup on localhost has no reason to need it.
+MAX_REQUESTS_PER_SOURCE_IP_PER_MINUTE = int(
+    os.getenv("ABUSEIPDB_MAX_REQUESTS_PER_SOURCE_IP_PER_MINUTE", "0")
+)
+_source_ip_rate_lock = threading.Lock()
+_source_ip_request_times = {}  # ip -> [recent request unix timestamps]
+_SOURCE_IP_RATE_WINDOW_SECONDS = 60
+
+
+def _check_source_ip_rate_limit(ip):
+    """True if this request should proceed, False if `ip` has already hit
+    MAX_REQUESTS_PER_SOURCE_IP_PER_MINUTE within the last
+    _SOURCE_IP_RATE_WINDOW_SECONDS. A sliding window, not a fixed
+    per-minute bucket, so it can't be gamed by timing requests around a
+    bucket boundary. Also self-prunes: an ip's entry is trimmed to only
+    still-relevant timestamps on every call for that ip, and dropped
+    entirely once empty, so this dict can't grow unboundedly from a long
+    tail of one-off source ips that only ever appear once."""
+    if MAX_REQUESTS_PER_SOURCE_IP_PER_MINUTE <= 0:
+        return True
+    now = time.time()
+    cutoff = now - _SOURCE_IP_RATE_WINDOW_SECONDS
+    with _source_ip_rate_lock:
+        times = [t for t in _source_ip_request_times.get(ip, []) if t >= cutoff]
+        if len(times) >= MAX_REQUESTS_PER_SOURCE_IP_PER_MINUTE:
+            _source_ip_request_times[ip] = times
+            return False
+        times.append(now)
+        _source_ip_request_times[ip] = times
+        return True
+
+
+def _prune_source_ip_rate_limit_state():
+    """Drops any ip whose whole entry has aged out, for an ip that hit the
+    limit and then simply never came back (its list would otherwise just
+    sit there, non-empty, since _check_source_ip_rate_limit() only prunes
+    the specific ip it's called for). Called periodically alongside the
+    existing orphan-reap loop rather than getting a whole dedicated timer
+    of its own for what's a very cheap sweep."""
+    now = time.time()
+    cutoff = now - _SOURCE_IP_RATE_WINDOW_SECONDS
+    with _source_ip_rate_lock:
+        for ip in list(_source_ip_request_times.keys()):
+            times = [t for t in _source_ip_request_times[ip] if t >= cutoff]
+            if times:
+                _source_ip_request_times[ip] = times
+            else:
+                del _source_ip_request_times[ip]
+
+
 # --- Alerting (Gotify / ntfy / Slack / Discord / Matrix / Telegram / -------
 # --- Home Assistant / generic webhook) --------------------------------------
 # All optional. Each backend activates itself as soon as its required
@@ -664,12 +746,52 @@ metrics = {
     "reports_quota_reserved_total": 0,
     "reports_whitelisted_total": 0,
     "reports_rejected_overload_total": 0,
+    "reports_rejected_rate_limited_total": 0,
 }
 
 
 def inc_metric(name, n=1):
     with metrics_lock:
         metrics[name] = metrics.get(name, 0) + n
+
+
+# --- Report-latency histogram -----------------------------------------
+# How long each actual AbuseIPDB API call takes, exposed via /metrics as
+# a standard Prometheus histogram. Complements the existing counters
+# (which say *whether* a report succeeded) with *how fast* -- useful for
+# telling "AbuseIPDB is slow right now" apart from "AbuseIPDB is down"
+# or "we're being rate-limited", none of which the counters alone
+# distinguish. Hand-rolled (no external prometheus_client dependency,
+# matching this project's stdlib-only design) rather than a full library
+# histogram implementation, since this is the only histogram-shaped
+# metric the proxy has.
+#
+# Bucket boundaries (seconds) span "fast" through "clearly something's
+# wrong" -- send_report_api()'s own urlopen() calls time out at 10s, so
+# anything at/above that already reflects a real stall, not just
+# AbuseIPDB being a little slow.
+_REPORT_LATENCY_BUCKETS = [0.1, 0.25, 0.5, 1, 2, 5, 10, 20]
+_report_latency_bucket_counts = [0] * (len(_REPORT_LATENCY_BUCKETS) + 1)  # last slot is +Inf
+_report_latency_sum = 0.0
+_report_latency_count = 0
+
+
+def _record_report_latency(seconds):
+    """Records one observation into the histogram above. Prometheus
+    histogram buckets are cumulative (le="X" counts every observation
+    <= X, not just ones that landed specifically in that bucket) -- the
+    loop below achieves that correctly simply by not breaking early: an
+    observation at or under a given bucket's boundary is also at or
+    under every larger boundary that follows it, so it increments all of
+    them, same as it must under the +Inf entry regardless of value."""
+    global _report_latency_sum, _report_latency_count
+    with metrics_lock:
+        _report_latency_sum += seconds
+        _report_latency_count += 1
+        for i, upper in enumerate(_REPORT_LATENCY_BUCKETS):
+            if seconds <= upper:
+                _report_latency_bucket_counts[i] += 1
+        _report_latency_bucket_counts[-1] += 1  # +Inf
 
 
 def _summary_loop():
@@ -1698,6 +1820,7 @@ def send_report_api(ip, categories, comment):
             log(f"Report for {ip} failed: {e}", level="warning", ip=ip)
             return False, None, None
 
+    _attempt_start = time.monotonic()
     success, retry_after, http_status = _attempt()
     if not success and http_status == 429:
         # A 429 on the *primary* key most likely means its daily quota is
@@ -1706,6 +1829,11 @@ def send_report_api(ip, categories, comment):
         # Retry-After says (can be hours, for a daily-quota 429).
         if _switch_to_fallback_key(f"HTTP 429 while reporting {ip}"):
             success, retry_after, http_status = _attempt()
+    # time.monotonic() rather than time.time(): this is a duration
+    # measurement, and unlike the rest of this file's time.time() calls
+    # (wall-clock timestamps), a duration must be immune to an NTP
+    # correction happening to land mid-request.
+    _record_report_latency(time.monotonic() - _attempt_start)
     return success, retry_after
 
 
@@ -2131,6 +2259,22 @@ def _orphan_rescan_loop():
             log(f"Orphaned pending/retry rescan failed: {e}", level="warning")
 
 
+def _source_ip_rate_limit_prune_loop():
+    # Deliberately its own loop/interval rather than piggybacking on
+    # _orphan_rescan_loop() above: that loop only runs at all when
+    # ORPHAN_RESCAN_INTERVAL > 0, which is unrelated to whether source-ip
+    # rate limiting is enabled -- coupling them would mean disabling one
+    # feature silently stops the other's cleanup from ever running,
+    # letting _source_ip_request_times grow unboundedly over time for a
+    # deployment with many distinct source ips.
+    while True:
+        time.sleep(_SOURCE_IP_RATE_WINDOW_SECONDS)
+        try:
+            _prune_source_ip_rate_limit_state()
+        except Exception as e:
+            log(f"Source-ip rate limit state prune failed: {e}", level="warning")
+
+
 class AbuseIPDBHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         client_ip = self.client_address[0]
@@ -2144,6 +2288,17 @@ class AbuseIPDBHandler(http.server.BaseHTTPRequestHandler):
             log(f"Rejected POST from {client_ip}: missing or invalid X-Proxy-Secret.",
                 level="warning", source_ip=client_ip)
             self.send_response(403)
+            self.end_headers()
+            return
+
+        if not _check_source_ip_rate_limit(client_ip):
+            log(f"Rejected POST from {client_ip}: over "
+                f"ABUSEIPDB_MAX_REQUESTS_PER_SOURCE_IP_PER_MINUTE "
+                f"({MAX_REQUESTS_PER_SOURCE_IP_PER_MINUTE}/min).",
+                level="warning", source_ip=client_ip)
+            inc_metric("reports_rejected_rate_limited_total")
+            self.send_response(429)
+            self.send_header("Retry-After", "60")
             self.end_headers()
             return
 
@@ -2298,6 +2453,10 @@ class AbuseIPDBHandler(http.server.BaseHTTPRequestHandler):
         counter("abuseipdb_proxy_reports_rejected_overload_total",
                  "Total POSTs rejected with 503 because ABUSEIPDB_MAX_CONCURRENT_REQUESTS was reached.",
                  snapshot.get("reports_rejected_overload_total", 0))
+        counter("abuseipdb_proxy_reports_rejected_rate_limited_total",
+                 "Total POSTs rejected with 429 because a single source ip exceeded "
+                 "ABUSEIPDB_MAX_REQUESTS_PER_SOURCE_IP_PER_MINUTE.",
+                 snapshot.get("reports_rejected_rate_limited_total", 0))
         gauge("abuseipdb_proxy_pending_escalations", "Current number of delayed escalation reports awaiting delivery.",
               len(pending_timers))
         gauge("abuseipdb_proxy_pending_retries", "Current number of reports queued for retry.",
@@ -2320,6 +2479,20 @@ class AbuseIPDBHandler(http.server.BaseHTTPRequestHandler):
         lines.append(f"# HELP abuseipdb_proxy_info Static build info, value is always 1.")
         lines.append(f"# TYPE abuseipdb_proxy_info gauge")
         lines.append(f'abuseipdb_proxy_info{{version="{VERSION}"}} 1')
+
+        with metrics_lock:
+            bucket_counts = list(_report_latency_bucket_counts)
+            latency_sum = _report_latency_sum
+            latency_count = _report_latency_count
+        lines.append("# HELP abuseipdb_proxy_report_latency_seconds How long each AbuseIPDB "
+                      "report API call took (including a fallback-key retry on a primary-key "
+                      "429), regardless of success or failure. Not recorded in dry-run mode.")
+        lines.append("# TYPE abuseipdb_proxy_report_latency_seconds histogram")
+        for i, upper in enumerate(_REPORT_LATENCY_BUCKETS):
+            lines.append(f'abuseipdb_proxy_report_latency_seconds_bucket{{le="{upper}"}} {bucket_counts[i]}')
+        lines.append(f'abuseipdb_proxy_report_latency_seconds_bucket{{le="+Inf"}} {bucket_counts[-1]}')
+        lines.append(f"abuseipdb_proxy_report_latency_seconds_sum {latency_sum}")
+        lines.append(f"abuseipdb_proxy_report_latency_seconds_count {latency_count}")
 
         body = ("\n".join(lines) + "\n").encode("utf-8")
         self.send_response(200)
@@ -3596,6 +3769,8 @@ if __name__ == "__main__":
         threading.Thread(target=_summary_loop, daemon=True).start()
     if ORPHAN_RESCAN_INTERVAL > 0:
         threading.Thread(target=_orphan_rescan_loop, daemon=True).start()
+    if MAX_REQUESTS_PER_SOURCE_IP_PER_MINUTE > 0:
+        threading.Thread(target=_source_ip_rate_limit_prune_loop, daemon=True).start()
     if NOTIFY_ON_START:
         mode = "dry-run" if DRY_RUN else "live"
         notify(f"Started ({mode} mode).", priority="low")
