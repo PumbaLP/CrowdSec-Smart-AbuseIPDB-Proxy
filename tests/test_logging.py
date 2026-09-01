@@ -88,3 +88,54 @@ def test_real_call_sites_actually_use_structured_fields(make_proxy, capsys, tmp_
     assert lines, "expected at least one log line from the migration"
     records = [json.loads(line) for line in lines]  # every line must be valid JSON
     assert any("entries" in r for r in records)  # the "Migration complete" line carries a field
+
+
+# --- Optional hostname/instance tag (ABUSEIPDB_LOG_HOSTNAME) ---------------
+
+def test_hostname_field_absent_by_default_in_json(make_proxy):
+    p = make_proxy(ABUSEIPDB_LOG_FORMAT="json")
+    assert p.LOG_HOSTNAME is None
+
+
+def test_hostname_field_absent_from_json_output_by_default(make_proxy, capsys):
+    p = make_proxy(ABUSEIPDB_LOG_FORMAT="json")
+    p.log("hi")
+    record = json.loads(capsys.readouterr().err.strip())
+    assert "hostname" not in record
+
+
+def test_hostname_field_absent_from_text_output_even_when_configured(make_proxy, capsys):
+    # LOG_HOSTNAME only affects JSON output -- text mode is read locally
+    # via journalctl on the host it's already running on, so a hostname
+    # tag on every line would just be noise there.
+    p = make_proxy(ABUSEIPDB_LOG_FORMAT="text", ABUSEIPDB_LOG_HOSTNAME="site-a")
+    p.log("hi")
+    captured = capsys.readouterr()
+    assert captured.err == "[abuseipdb-proxy] hi\n"
+
+
+def test_explicit_hostname_string_is_used_verbatim(make_proxy, capsys):
+    p = make_proxy(ABUSEIPDB_LOG_FORMAT="json", ABUSEIPDB_LOG_HOSTNAME="site-chemnitz-1")
+    assert p.LOG_HOSTNAME == "site-chemnitz-1"
+    p.log("hi")
+    record = json.loads(capsys.readouterr().err.strip())
+    assert record["hostname"] == "site-chemnitz-1"
+
+
+@pytest.mark.parametrize("value", ["true", "True", "1", "yes", " TRUE "])
+def test_truthy_values_auto_detect_the_system_hostname(make_proxy, value):
+    p = make_proxy(ABUSEIPDB_LOG_FORMAT="json", ABUSEIPDB_LOG_HOSTNAME=value)
+    assert p.LOG_HOSTNAME == p.socket.gethostname()
+    assert p.LOG_HOSTNAME  # never empty/falsy on a real system
+
+
+def test_auto_detected_hostname_appears_in_json_output(make_proxy, capsys):
+    p = make_proxy(ABUSEIPDB_LOG_FORMAT="json", ABUSEIPDB_LOG_HOSTNAME="true")
+    p.log("hi")
+    record = json.loads(capsys.readouterr().err.strip())
+    assert record["hostname"] == p.socket.gethostname()
+
+
+def test_empty_hostname_setting_behaves_like_unset(make_proxy):
+    p = make_proxy(ABUSEIPDB_LOG_FORMAT="json", ABUSEIPDB_LOG_HOSTNAME="  ")
+    assert p.LOG_HOSTNAME is None
