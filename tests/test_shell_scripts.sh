@@ -12,7 +12,7 @@
 #
 # Neither is something the Python test suite can exercise (they're pure
 # shell-script behavior), so this exists specifically to keep both fixed
-# going forward. Run from the repo root: bash .github/scripts/test_shell_scripts.sh
+# going forward. Run from the repo root: bash tests/test_shell_scripts.sh
 #
 # Destructive: writes to /etc/abuseipdb-proxy, /usr/local/bin,
 # /var/lib/abuseipdb-proxy, /etc/systemd/system. Intended for an ephemeral
@@ -20,7 +20,7 @@
 # proxy host.
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "${WORKDIR}"' EXIT
 
