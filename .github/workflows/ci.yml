@@ -52,7 +52,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Run install.sh / update.sh behavioral regression tests
-        run: sudo bash .github/scripts/test_shell_scripts.sh
+        run: sudo bash tests/test_shell_scripts.sh
 
   test:
     runs-on: ubuntu-latest
