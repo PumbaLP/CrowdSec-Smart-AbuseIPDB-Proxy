@@ -3,6 +3,7 @@ source = .
 omit =
     tests/*
     setup.py
+    sitecustomize.py
 
 [report]
 exclude_lines =

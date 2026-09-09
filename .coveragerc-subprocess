@@ -1,0 +1,19 @@
+; Used only for subprocess coverage measurement (see sitecustomize.py and
+; tests/conftest.py's pytest_configure hook) -- deliberately NOT the same
+; file as .coveragerc, which pytest-cov itself uses for its own in-process
+; measurement. Setting `parallel = true` in that shared file was tried
+; first and broke pytest-cov's own direct-call coverage collection (most
+; of this project's coverage comes from tests calling functions directly,
+; not from subprocesses); keeping it here instead means only the
+; subprocess side writes suffixed `.coverage.<host>.<pid>.<rand>` files,
+; which coverage.py's own combine step (run automatically by pytest-cov
+; at session end) picks up and merges into the same final `.coverage`
+; file regardless.
+[run]
+parallel = true
+data_file = .coverage
+source = .
+omit =
+    tests/*
+    setup.py
+    sitecustomize.py

@@ -31,7 +31,7 @@ import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 
-VERSION = "3.2.0"
+VERSION = "3.2.1"
 
 START_TIME = time.time()
 
