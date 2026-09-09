@@ -5,6 +5,7 @@ reading ABUSEIPDB_CACHE_BACKEND/ABUSEIPDB_CACHE_FILE, since there's
 nothing for those to point at anymore.
 """
 import json
+import os
 import sqlite3
 from contextlib import closing
 
@@ -125,3 +126,60 @@ def test_cache_file_ending_in_json_is_redirected_to_db(make_proxy, tmp_path):
     # corrupt/misinterpret the old JSON file.
     p = make_proxy(ABUSEIPDB_CACHE_FILE=str(tmp_path / "cache.json"))
     assert p.CACHE_FILE == str(tmp_path / "cache.db")
+
+
+def test_ensure_column_reraises_a_genuinely_different_operational_error(proxy):
+    conn = proxy._sqlite_connect()
+    try:
+        with pytest.raises(proxy.sqlite3.OperationalError):
+            proxy._ensure_column(conn, "no_such_table", "col", "INTEGER")
+    finally:
+        conn.close()
+
+
+# --- _migrate_json_to_sqlite_if_needed() -- the automatic one-time import
+# of a legacy cache.json sitting next to a brand-new SQLite cache file
+# (distinct from --migrate-to-sqlite, the explicit CLI command tested
+# above) ------------------------------------------------------------------
+
+def test_auto_migrate_reports_a_clean_error_if_sqlite_write_fails(proxy, monkeypatch, tmp_path):
+    legacy_path = os.path.join(os.path.dirname(proxy.CACHE_FILE) or ".", "cache.json")
+    with open(legacy_path, "w") as f:
+        json.dump({"reports": {"1.2.3.4": {"time": 1000, "severity": 2}},
+                    "pending": {}, "retry_queue": {}}, f)
+
+    def boom(cache):
+        raise sqlite3.OperationalError("disk full")
+
+    monkeypatch.setattr(proxy, "_save_cache_sqlite", boom)
+    proxy._migrate_json_to_sqlite_if_needed()  # must not raise
+
+    # the legacy file must survive untouched if the sqlite write failed
+    assert os.path.exists(legacy_path)
+
+
+def test_auto_migrate_still_succeeds_if_renaming_the_old_file_fails(proxy, monkeypatch, capsys):
+    legacy_path = os.path.join(os.path.dirname(proxy.CACHE_FILE) or ".", "cache.json")
+    with open(legacy_path, "w") as f:
+        json.dump({"reports": {"1.2.3.4": {"time": 1000, "severity": 2}},
+                    "pending": {}, "retry_queue": {}}, f)
+
+    def boom(src, dst):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(proxy.os, "replace", boom)
+    proxy._migrate_json_to_sqlite_if_needed()
+
+    assert "couldn't rename the old file" in capsys.readouterr().err
+    # couldn't rename it -- the legacy file is left in its original place
+    assert os.path.exists(legacy_path)
+
+
+def test_migrate_reports_a_clean_error_if_the_sqlite_write_fails(proxy, json_cache_file, monkeypatch):
+    def boom(cache, path=None):
+        raise sqlite3.OperationalError("disk full")
+
+    monkeypatch.setattr(proxy, "_save_cache_sqlite", boom)
+    result = proxy.run_migrate_to_sqlite(str(json_cache_file))
+    assert "error" in result
+    assert "Migration failed" in result["error"]

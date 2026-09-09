@@ -94,3 +94,15 @@ def test_format_simulate_text_shows_held_back_state(make_proxy):
     result = p.simulate_alert("14")
     text = p.format_simulate_text(result)
     assert "WOULD BE HELD BACK" in text
+
+
+def test_format_simulate_text_shows_immediate_send_when_not_reserved(proxy):
+    result = proxy.simulate_alert("15")
+    text = proxy.format_simulate_text(result)
+    # quota_known is False here (no report ever sent), so this exercises
+    # the "unknown" branch; force a known, non-reserved quota to hit the
+    # "would send immediately" branch specifically.
+    result["quota_known"] = True
+    result["quota_remaining"] = 500
+    text = proxy.format_simulate_text(result)
+    assert "would send immediately" in text

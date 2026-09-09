@@ -71,3 +71,15 @@ def test_malformed_ignore_ips_entry_is_skipped_not_fatal(make_proxy):
     # startup — it should just be skipped (with a warning on stderr).
     p = make_proxy(ABUSEIPDB_IGNORE_IPS="not-a-cidr,203.0.113.5")
     assert p.is_ignored_ip("203.0.113.5") is True
+
+
+def test_build_ignore_networks_tolerates_a_bad_default_entry(proxy, monkeypatch):
+    # Defensive-only branch: every entry in _DEFAULT_IGNORE_NETWORKS is a
+    # hardcoded, valid CIDR, so this can't happen via normal
+    # configuration -- only reachable if that hardcoded list itself ever
+    # gets a typo. Confirms _build_ignore_networks() degrades gracefully
+    # (skips the bad entry) rather than crashing the whole proxy at
+    # import time if that ever happens.
+    monkeypatch.setattr(proxy, "_DEFAULT_IGNORE_NETWORKS", ["not-a-cidr", "10.0.0.0/8"])
+    nets = proxy._build_ignore_networks()
+    assert any(str(n) == "10.0.0.0/8" for n in nets)

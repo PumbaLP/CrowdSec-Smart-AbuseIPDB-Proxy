@@ -105,3 +105,22 @@ def test_metrics_endpoint_exposes_the_histogram(running_server):
     assert 'abuseipdb_proxy_report_latency_seconds_bucket{le="+Inf"} 2' in body
     assert "abuseipdb_proxy_report_latency_seconds_sum 3.05" in body
     assert "abuseipdb_proxy_report_latency_seconds_count 2" in body
+
+
+def test_malformed_retry_after_header_is_ignored(make_proxy, monkeypatch):
+    p = make_proxy(ABUSEIPDB_DRY_RUN="false", ABUSEIPDB_API_KEY="test-key")
+
+    class FakeHTTPError(p.urllib.error.HTTPError):
+        def __init__(self):
+            super().__init__("http://x", 429, "Too Many Requests",
+                              {"Retry-After": "not-a-number"}, None)
+
+    def raise_429(req, timeout=10):
+        raise FakeHTTPError()
+
+    monkeypatch.setattr(p.urllib.request, "urlopen", raise_429)
+
+    success, retry_after = p.send_report_api("1.2.3.4", "15", "test")
+
+    assert success is False
+    assert retry_after is None  # malformed header -- falls back gracefully, not a crash

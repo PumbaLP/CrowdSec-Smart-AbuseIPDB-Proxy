@@ -9,6 +9,8 @@ Tests for four opt-in additions, all off by default:
 import json
 import urllib.error
 
+from conftest import FakeTimer
+
 import pytest
 
 
@@ -303,3 +305,87 @@ def test_whitelist_cache_evicts_expired_entries_on_write(make_proxy, monkeypatch
 
     assert "1.1.1.1" not in p._whitelist_cache
     assert "2.2.2.2" in p._whitelist_cache
+
+
+def test_is_source_ip_allowed_returns_false_for_unparseable_ip(make_proxy):
+    p = make_proxy(ABUSEIPDB_ALLOWED_SOURCE_IPS="10.0.0.0/8")
+    assert p.is_source_ip_allowed("not-an-ip") is False
+
+
+def test_parse_category_windows_skips_a_non_numeric_value(proxy):
+    windows = proxy._parse_category_windows("18=not-a-number,21=300")
+    assert windows == {"21": 300}
+
+
+# --- VERBOSE_LOGGING branches and other coverage gaps found via analysis ---
+
+def test_stale_report_entry_is_treated_as_no_entry(make_proxy, deferred_thread, monkeypatch):
+    p = make_proxy(ABUSEIPDB_DRY_RUN="true")
+    # Prevent _maybe_sweep_stale_reports() from deleting the stale row
+    # outright before process_alert()'s own staleness check ever gets to
+    # see it -- a fresh module's first call always triggers an immediate
+    # sweep (_last_stale_report_sweep starts at 0.0), which would
+    # otherwise make `entry` come back as a plain DB-miss None rather
+    # than exercising the specific "found but stale" code path.
+    monkeypatch.setattr(p, "_maybe_sweep_stale_reports", lambda: None)
+    now = int(p.time.time())
+    p._sqlite_upsert_report("1.2.3.4", now - 90000, 1)  # >24h old
+    p.process_alert("1.2.3.4", "14", "port scan", new_severity=1)
+    deferred_thread.run_all()
+    # a genuinely new report gets written since the stale one is ignored
+    assert p.load_cache()["reports"]["1.2.3.4"]["time"] > now - 100
+
+
+def test_verbose_logging_logs_successful_report(make_proxy, capsys, monkeypatch):
+    p = make_proxy(ABUSEIPDB_DRY_RUN="false", ABUSEIPDB_API_KEY="x", ABUSEIPDB_VERBOSE_LOGGING="true")
+    monkeypatch.setattr(p, "send_report_api", lambda ip, cats, comment: (True, None))
+    p.send_with_retry("1.2.3.4", "15", "test")
+    assert "Reported 1.2.3.4 to AbuseIPDB" in capsys.readouterr().err
+
+
+def test_verbose_logging_logs_quota_deferral_in_finalize_pending(make_proxy, capsys, deferred_thread, monkeypatch):
+    p = make_proxy(ABUSEIPDB_VERBOSE_LOGGING="true", ABUSEIPDB_QUOTA_RESERVE_HIGH="100")
+    monkeypatch.setattr(p.threading, "Timer", FakeTimer)
+    FakeTimer.instances = []
+    p.quota_state["remaining"] = 50
+    p.process_alert("1.2.3.4", "14", "port scan", new_severity=1)
+    deferred_thread.run_all()
+    p._finalize_pending("1.2.3.4", "14", "port scan", 1)
+    assert "Deferring due escalation" in capsys.readouterr().err
+
+
+def test_verbose_logging_logs_quota_deferral_in_no_entry_branch(make_proxy, capsys):
+    p = make_proxy(ABUSEIPDB_VERBOSE_LOGGING="true", ABUSEIPDB_QUOTA_RESERVE_HIGH="100")
+    p.quota_state["remaining"] = 50
+    p.process_alert("1.2.3.4", "14", "port scan", new_severity=1)
+    assert "Deferring report" in capsys.readouterr().err
+
+
+def test_verbose_logging_logs_quota_deferral_in_escalation_branch(make_proxy, capsys, deferred_thread, monkeypatch):
+    p = make_proxy(ABUSEIPDB_VERBOSE_LOGGING="true", ABUSEIPDB_REPORT_WINDOW="0",
+                    ABUSEIPDB_QUOTA_RESERVE_HIGH="100")
+    monkeypatch.setattr(p.threading, "Timer", FakeTimer)
+    FakeTimer.instances = []
+    p.process_alert("1.2.3.4", "14", "port scan", new_severity=1)
+    deferred_thread.run_all()
+    p.quota_state["remaining"] = 50
+    p.process_alert("1.2.3.4", "18", "brute-force", new_severity=2)
+    deferred_thread.run_all()
+    assert "Deferring escalation" in capsys.readouterr().err
+
+
+def test_lower_severity_alert_evicts_a_waiting_lower_pending_timer(make_proxy, monkeypatch):
+    # "no entry" branch: a pending timer already waiting for a *strictly
+    # lower* severity gets cancelled and replaced when a higher-severity
+    # alert for the same ip supersedes it.
+    p = make_proxy(ABUSEIPDB_QUOTA_RESERVE_HIGH="100")
+    monkeypatch.setattr(p.threading, "Timer", FakeTimer)
+    FakeTimer.instances = []
+    p.quota_state["remaining"] = 50
+    p.process_alert("1.2.3.4", "14", "port scan", new_severity=1)
+    assert "1.2.3.4" in p.pending_timers
+    first_timer = p.pending_timers["1.2.3.4"]["timer"]
+
+    p.process_alert("1.2.3.4", "18", "brute-force", new_severity=2)  # higher -> evicts
+
+    assert first_timer.cancelled

@@ -377,3 +377,14 @@ class TestHealthEndpointBacklogAge:
 
         assert result["oldest_pending_escalation_age_seconds"] is not None
         assert result["oldest_pending_retry_age_seconds"] is None  # nothing in retry_queue
+
+
+def test_no_estimate_with_an_incomplete_quota_snapshot(proxy):
+    # The first guard clause -- distinct from the "day is stale" and
+    # "not enough elapsed time" checks below it, and not exercised by
+    # either of those since they assume a *complete* dict already.
+    assert proxy.estimate_quota_exhaustion({"remaining": 900}) is None
+    assert proxy.estimate_quota_exhaustion({"remaining": 900, "day_start_remaining": 1000}) is None
+    assert proxy.estimate_quota_exhaustion(
+        {"remaining": 900, "day_start_remaining": 1000, "day_start_time": None}
+    ) is None

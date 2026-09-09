@@ -201,3 +201,53 @@ def test_cli_stats_does_not_require_dry_run_or_real_key(tmp_path):
 
     result = run("--stats", env=env)
     assert result.returncode == 0
+
+
+# --- format_stats_text() -- the human-readable rendering of build_stats(),
+# not previously covered separately from build_stats() itself ------------
+
+def test_format_shows_pending_and_retries_when_present(proxy):
+    now = int(time.time())
+    proxy.save_cache({
+        "reports": {},
+        "pending": {"9.9.9.9": {"due_time": now + 100, "severity": 3, "categories": "15", "comment": "x"}},
+        "retry_queue": {"8.8.8.8": {"due_time": now + 200, "categories": "18", "comment": "y", "attempts": 2}},
+    })
+    text = proxy.format_stats_text(proxy.build_stats())
+    assert "Pending escalations: 1" in text
+    assert "9.9.9.9" in text
+    assert "Queued retries: 1" in text
+    assert "8.8.8.8" in text
+
+
+def test_format_shows_none_when_no_pending_or_retries(proxy):
+    text = proxy.format_stats_text(proxy.build_stats())
+    assert "Pending escalations: none" in text
+    assert "Queued retries: none" in text
+
+
+def test_format_shows_quota_when_known(proxy):
+    proxy._update_quota_from_headers({"X-RateLimit-Limit": "1000", "X-RateLimit-Remaining": "500"})
+    text = proxy.format_stats_text(proxy.build_stats())
+    assert "500/1000 remaining" in text
+
+
+def test_format_shows_quota_eta_when_projectable(proxy):
+    proxy._update_quota_from_headers({"X-RateLimit-Limit": "1000", "X-RateLimit-Remaining": "1000"})
+    proxy.quota_state["day_start_time"] -= 600
+    proxy._update_quota_from_headers({"X-RateLimit-Limit": "1000", "X-RateLimit-Remaining": "900"})
+    text = proxy.format_stats_text(proxy.build_stats())
+    assert "may run out around" in text
+
+
+def test_format_shows_recent_reports_when_present(proxy):
+    proxy.save_cache({"reports": {"1.2.3.4": {"time": int(time.time()), "severity": 2}},
+                       "pending": {}, "retry_queue": {}})
+    text = proxy.format_stats_text(proxy.build_stats())
+    assert "1.2.3.4" in text
+    assert "Most recently reported IPs" in text
+
+
+def test_format_shows_no_reports_message_when_empty(proxy):
+    text = proxy.format_stats_text(proxy.build_stats())
+    assert "No reports currently tracked." in text

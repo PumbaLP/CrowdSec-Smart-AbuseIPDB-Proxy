@@ -373,3 +373,106 @@ def test_oversized_content_length_is_rejected_without_reading_the_body(running_s
     conn.close()
 
     assert status == 400
+
+
+def test_disallowed_source_ip_gets_403(running_server):
+    # ABUSEIPDB_ALLOWED_SOURCE_IPS excludes 127.0.0.1 -- since these tests
+    # always connect from localhost, this simulates a source that isn't
+    # in an active allowlist.
+    p, base_url = running_server(ABUSEIPDB_ALLOWED_SOURCE_IPS="203.0.113.0/24")
+    try:
+        _post(base_url, "1.2.3.4")
+        assert False, "expected an HTTPError"
+    except urllib.error.HTTPError as e:
+        assert e.code == 403
+
+
+def test_missing_shared_secret_gets_403(running_server):
+    p, base_url = running_server(ABUSEIPDB_SHARED_SECRET="a" * 20)
+    try:
+        _post(base_url, "1.2.3.4")
+        assert False, "expected an HTTPError"
+    except urllib.error.HTTPError as e:
+        assert e.code == 403
+
+
+def test_correct_shared_secret_is_accepted(running_server):
+    p, base_url = running_server(ABUSEIPDB_SHARED_SECRET="a" * 20, ABUSEIPDB_DRY_RUN="true")
+    req = urllib.request.Request(
+        base_url + "/", method="POST",
+        data=json.dumps({"ip": "1.2.3.4", "categories": "15", "comment": "x"}).encode(),
+        headers={"Content-Type": "application/json", "X-Proxy-Secret": "a" * 20},
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        assert resp.status == 200
+
+
+def test_health_disabled_by_default_gives_404(running_server):
+    p, base_url = running_server()
+    try:
+        urllib.request.urlopen(base_url + "/health", timeout=5)
+        assert False, "expected 404"
+    except urllib.error.HTTPError as e:
+        assert e.code == 404
+
+
+def test_metrics_disabled_by_default_gives_404(running_server):
+    p, base_url = running_server()
+    try:
+        urllib.request.urlopen(base_url + "/metrics", timeout=5)
+        assert False, "expected 404"
+    except urllib.error.HTTPError as e:
+        assert e.code == 404
+
+
+def test_unknown_path_gives_404(running_server):
+    p, base_url = running_server()
+    try:
+        urllib.request.urlopen(base_url + "/nonexistent", timeout=5)
+        assert False, "expected 404"
+    except urllib.error.HTTPError as e:
+        assert e.code == 404
+
+
+def test_metrics_includes_fallback_key_and_quota_gauges_when_applicable(running_server):
+    p, base_url = running_server(ABUSEIPDB_ENABLE_METRICS="true", ABUSEIPDB_API_KEY_FALLBACK="fallback-key")
+    p._using_fallback_key = True
+    p._update_quota_from_headers({"X-RateLimit-Limit": "1000", "X-RateLimit-Remaining": "500"})
+
+    with urllib.request.urlopen(base_url + "/metrics", timeout=5) as resp:
+        body = resp.read().decode()
+
+    assert "abuseipdb_proxy_using_fallback_key 1" in body
+    assert "abuseipdb_proxy_quota_remaining 500" in body
+    assert "abuseipdb_proxy_quota_limit 1000" in body
+
+
+def test_non_string_categories_and_comment_fall_back_to_defaults(running_server):
+    p, base_url = running_server(ABUSEIPDB_DRY_RUN="true")
+    body = json.dumps({"ip": "1.2.3.4", "categories": 12345, "comment": ["not", "a", "string"]}).encode("utf-8")
+    req = urllib.request.Request(base_url + "/", data=body, method="POST",
+                                  headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        assert resp.status == 200
+
+
+def test_verbose_logging_logs_ignored_private_ip(running_server, monkeypatch):
+    p, base_url = running_server(ABUSEIPDB_VERBOSE_LOGGING="true", ABUSEIPDB_DRY_RUN="true")
+    logged = []
+    monkeypatch.setattr(p, "log", lambda msg, level="info", **f: logged.append(msg))
+
+    _post(base_url, "127.0.0.1")
+
+    assert any("Ignoring private/excluded IP" in msg for msg in logged)
+
+
+def test_verbose_logging_logs_whitelisted_ip(running_server, monkeypatch):
+    p, base_url = running_server(ABUSEIPDB_VERBOSE_LOGGING="true", ABUSEIPDB_DRY_RUN="true",
+                                  ABUSEIPDB_SKIP_WHITELISTED="true")
+    monkeypatch.setattr(p, "is_whitelisted", lambda ip: True)
+    logged = []
+    monkeypatch.setattr(p, "log", lambda msg, level="info", **f: logged.append(msg))
+
+    _post(base_url, "8.8.8.8")
+
+    assert any("Skipping AbuseIPDB-whitelisted IP" in msg for msg in logged)

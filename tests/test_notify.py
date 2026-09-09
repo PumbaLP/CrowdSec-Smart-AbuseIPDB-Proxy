@@ -367,3 +367,177 @@ def test_homeassistant_requires_both_url_and_token(proxy, monkeypatch):
     proxy.notify("hi")
 
     assert calls == []
+
+
+# --- Backend-failure paths (each backend's `except Exception` handler,
+# confirming a network/API failure is caught and logged rather than
+# raised -- notify() runs each backend in its own thread, so a raised
+# exception here would otherwise be silently swallowed by the thread
+# anyway, but the explicit catch-and-log is what makes it visible in the
+# logs at all) -----------------------------------------------------------
+
+def test_ntfy_never_raises_on_failure(proxy, monkeypatch):
+    monkeypatch.setattr(proxy, "NTFY_URL", "https://ntfy.example.com/mytopic")
+
+    def boom(req, timeout=10):
+        raise OSError("network is down")
+
+    monkeypatch.setattr(proxy.urllib.request, "urlopen", boom)
+    proxy._notify_ntfy("hi", "normal")  # must not raise
+
+
+def test_ntfy_uses_bearer_token_when_configured(proxy, monkeypatch):
+    monkeypatch.setattr(proxy, "NTFY_URL", "https://ntfy.example.com/mytopic")
+    monkeypatch.setattr(proxy, "NTFY_TOKEN", "secret-token")
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b""
+
+    def fake_urlopen(req, timeout=10):
+        captured["headers"] = dict(req.header_items())
+        return FakeResponse()
+
+    monkeypatch.setattr(proxy.urllib.request, "urlopen", fake_urlopen)
+    proxy._notify_ntfy("hi", "normal")
+
+    assert captured["headers"]["Authorization"] == "Bearer secret-token"
+
+
+def test_ntfy_omits_authorization_header_without_a_token(proxy, monkeypatch):
+    monkeypatch.setattr(proxy, "NTFY_URL", "https://ntfy.example.com/mytopic")
+    monkeypatch.setattr(proxy, "NTFY_TOKEN", "")
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b""
+
+    def fake_urlopen(req, timeout=10):
+        captured["headers"] = dict(req.header_items())
+        return FakeResponse()
+
+    monkeypatch.setattr(proxy.urllib.request, "urlopen", fake_urlopen)
+    proxy._notify_ntfy("hi", "normal")
+
+    assert "Authorization" not in captured["headers"]
+
+
+def test_webhook_never_raises_on_failure(proxy, monkeypatch):
+    monkeypatch.setattr(proxy, "WEBHOOK_URL", "https://hooks.example.com/generic")
+
+    def boom(req, timeout=10):
+        raise OSError("network is down")
+
+    monkeypatch.setattr(proxy.urllib.request, "urlopen", boom)
+    proxy._notify_webhook("hi", "normal")  # must not raise
+
+
+def test_webhook_request_shape(proxy, monkeypatch):
+    monkeypatch.setattr(proxy, "WEBHOOK_URL", "https://hooks.example.com/generic")
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b""
+
+    def fake_urlopen(req, timeout=10):
+        captured["url"] = req.full_url
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return FakeResponse()
+
+    monkeypatch.setattr(proxy.urllib.request, "urlopen", fake_urlopen)
+
+    proxy._notify_webhook("something failed", "high")
+
+    assert captured["url"] == "https://hooks.example.com/generic"
+    assert captured["body"]["message"] == "something failed"
+    assert captured["body"]["priority"] == "high"
+
+
+def test_slack_never_raises_on_failure(proxy, monkeypatch):
+    monkeypatch.setattr(proxy, "SLACK_WEBHOOK_URL", "https://hooks.slack.com/services/x")
+
+    def boom(req, timeout=10):
+        raise OSError("network is down")
+
+    monkeypatch.setattr(proxy.urllib.request, "urlopen", boom)
+    proxy._notify_slack("hi", "normal")  # must not raise
+
+
+def test_discord_never_raises_on_failure(proxy, monkeypatch):
+    monkeypatch.setattr(proxy, "DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/x")
+
+    def boom(req, timeout=10):
+        raise OSError("network is down")
+
+    monkeypatch.setattr(proxy.urllib.request, "urlopen", boom)
+    proxy._notify_discord("hi", "normal")  # must not raise
+
+
+def test_matrix_never_raises_on_failure(proxy, monkeypatch):
+    monkeypatch.setattr(proxy, "MATRIX_HOMESERVER_URL", "https://matrix.example.com")
+    monkeypatch.setattr(proxy, "MATRIX_ACCESS_TOKEN", "t")
+    monkeypatch.setattr(proxy, "MATRIX_ROOM_ID", "!room:example.com")
+
+    def boom(req, timeout=10):
+        raise OSError("network is down")
+
+    monkeypatch.setattr(proxy.urllib.request, "urlopen", boom)
+    proxy._notify_matrix("hi", "normal")  # must not raise
+
+
+# --- _configured_alerting_backends() -- the summary line used in the
+# startup banner and --check-config, listing which backends are active ---
+
+def test_no_backends_configured(proxy):
+    assert proxy._configured_alerting_backends() == "none configured"
+
+
+def test_lists_each_backend_name_when_fully_configured(make_proxy):
+    p = make_proxy(
+        ABUSEIPDB_GOTIFY_URL="https://gotify.example.com",
+        ABUSEIPDB_GOTIFY_TOKEN="t",
+        ABUSEIPDB_NTFY_URL="https://ntfy.example.com/topic",
+        ABUSEIPDB_WEBHOOK_URL="https://hooks.example.com/generic",
+        ABUSEIPDB_SLACK_WEBHOOK_URL="https://hooks.slack.com/services/x",
+        ABUSEIPDB_DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/x",
+        ABUSEIPDB_MATRIX_HOMESERVER_URL="https://matrix.example.com",
+        ABUSEIPDB_MATRIX_ACCESS_TOKEN="t",
+        ABUSEIPDB_MATRIX_ROOM_ID="!room:example.com",
+        ABUSEIPDB_TELEGRAM_BOT_TOKEN="t",
+        ABUSEIPDB_TELEGRAM_CHAT_ID="123",
+        ABUSEIPDB_HOMEASSISTANT_URL="https://ha.example.com",
+        ABUSEIPDB_HOMEASSISTANT_TOKEN="t",
+    )
+    result = p._configured_alerting_backends()
+    for name in ("Gotify", "ntfy", "webhook", "Slack", "Discord", "Matrix", "Telegram", "Home Assistant"):
+        assert name in result
+
+
+def test_partially_configured_backend_is_not_listed(make_proxy):
+    # Matrix requires all three of homeserver/token/room -- only two set.
+    p = make_proxy(
+        ABUSEIPDB_MATRIX_HOMESERVER_URL="https://matrix.example.com",
+        ABUSEIPDB_MATRIX_ACCESS_TOKEN="t",
+    )
+    assert "Matrix" not in p._configured_alerting_backends()

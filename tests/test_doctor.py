@@ -375,3 +375,100 @@ def test_quota_includes_eta_when_projectable(proxy):
     results = proxy.run_doctor(check_network=False)
 
     assert any("run out around" in msg for _, msg in results)
+
+
+# --- Additional branches found via coverage analysis --------------------
+
+def test_env_file_with_good_permissions_is_ok(proxy, monkeypatch, tmp_path):
+    fake_env = tmp_path / "abuseipdb-proxy.env"
+    fake_env.write_text("ABUSEIPDB_API_KEY=x")
+    fake_env.chmod(0o600)
+    monkeypatch.setattr(proxy, "_run_systemctl", lambda *a: (None, None))
+
+    real_exists = os.path.exists
+    monkeypatch.setattr(proxy.os.path, "exists",
+                         lambda p: True if p == "/etc/abuseipdb-proxy/abuseipdb-proxy.env" else real_exists(p))
+    real_stat = os.stat
+    monkeypatch.setattr(proxy.os, "stat",
+                         lambda p, *a, **kw: os.stat(str(fake_env)) if p == "/etc/abuseipdb-proxy/abuseipdb-proxy.env" else real_stat(p, *a, **kw))
+
+    results = proxy.run_doctor(check_network=False)
+    assert any(level == "ok" and "permissions look fine (600)" in msg for level, msg in results)
+
+
+def test_cache_dir_permissions_checked(proxy, monkeypatch, tmp_path):
+    monkeypatch.setattr(proxy, "_run_systemctl", lambda *a: (None, None))
+    monkeypatch.setattr(proxy, "CACHE_FILE", str(tmp_path / "cache.db"))
+    os.chmod(tmp_path, 0o777)
+
+    results = proxy.run_doctor(check_network=False)
+    assert any("Cache directory" in msg and "permissive" in msg for level, msg in results)
+
+
+def test_cache_dir_with_good_permissions_is_ok(proxy, monkeypatch, tmp_path):
+    monkeypatch.setattr(proxy, "_run_systemctl", lambda *a: (None, None))
+    monkeypatch.setattr(proxy, "CACHE_FILE", str(tmp_path / "cache.db"))
+    os.chmod(tmp_path, 0o700)
+
+    results = proxy.run_doctor(check_network=False)
+    assert any(level == "ok" and "Cache directory" in msg and "permissions look fine (700)" in msg
+               for level, msg in results)
+
+
+def test_crowdsec_notification_config_found_is_ok(proxy, monkeypatch):
+    monkeypatch.setattr(proxy, "_run_systemctl", lambda *a: (None, None))
+    real_exists = os.path.exists
+    monkeypatch.setattr(proxy.os.path, "exists",
+                         lambda p: True if "notifications/abuseipdb.yaml" in p else real_exists(p))
+
+    results = proxy.run_doctor(check_network=False)
+    assert any(level == "ok" and "CrowdSec notification config found" in msg for level, msg in results)
+
+
+def test_profiles_yaml_unreadable_warns(proxy, monkeypatch):
+    monkeypatch.setattr(proxy, "_run_systemctl", lambda *a: (None, None))
+    real_exists = os.path.exists
+    monkeypatch.setattr(proxy.os.path, "exists",
+                         lambda p: True if p == "/etc/crowdsec/profiles.yaml" else real_exists(p))
+
+    real_open = open
+
+    def fake_open(path, *a, **kw):
+        if path == "/etc/crowdsec/profiles.yaml":
+            raise OSError("permission denied")
+        return real_open(path, *a, **kw)
+
+    import builtins
+    monkeypatch.setattr(builtins, "open", fake_open)
+
+    results = proxy.run_doctor(check_network=False)
+    assert any(level == "warn" and "Could not read" in msg and "profiles.yaml" in msg for level, msg in results)
+
+
+def test_systemctl_not_available_is_skipped(proxy, monkeypatch):
+    monkeypatch.setattr(proxy.subprocess, "run",
+                         lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError()))
+    results = proxy.run_doctor(check_network=False)
+    assert any(level == "skip" and "systemd not available" in msg for level, msg in results)
+
+
+def test_live_self_test_success_is_ok(proxy, monkeypatch):
+    monkeypatch.setattr(proxy, "run_live_self_test", lambda: {"ok": True, "detail": "all good"})
+    results = proxy.run_doctor(check_network=True)
+    assert any(level == "ok" and "Live self-test: all good" in msg for level, msg in results)
+
+
+def test_live_self_test_helper_reports_non_200_status(proxy, monkeypatch):
+    class FakeResponse:
+        status = 500
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def read(self):
+            return b""
+
+    monkeypatch.setattr(proxy.urllib.request, "urlopen", lambda req, timeout=10: FakeResponse())
+    result = proxy.run_live_self_test()
+    assert result["ok"] is False
+    assert "unexpected HTTP 500" in result["detail"]

@@ -11,6 +11,7 @@ time.
 """
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -18,6 +19,25 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MODULE_PATH = REPO_ROOT / "abuseipdb_proxy.py"
+
+
+def pytest_configure(config):
+    """Enables subprocess coverage measurement, but only when this run
+    is actually under `pytest --cov` in the first place -- setting
+    COVERAGE_PROCESS_START unconditionally would make every CLI
+    subprocess spawned by test_cli.py/test_check_config.py/etc. write
+    out stray `.coverage.*` data files even for a plain `pytest`
+    invocation with no coverage involved at all. Subprocess tests build
+    their env from os.environ (directly, or via `{**os.environ, ...}`),
+    so setting this here in the parent process's own environ is what
+    gets it propagated down to them -- see sitecustomize.py at the repo
+    root for the other half of this (what actually starts measuring
+    inside the subprocess once it sees this variable). Uses a separate
+    .coveragerc-subprocess (not the main .coveragerc) because parallel
+    mode there was found to interfere with pytest-cov's own in-process
+    measurement."""
+    if config.pluginmanager.hasplugin("_cov") and config.getoption("--cov", default=None):
+        os.environ["COVERAGE_PROCESS_START"] = str(REPO_ROOT / ".coveragerc-subprocess")
 
 # Env vars the module reads at import time. Cleared before every test so
 # a developer's real ~/.bashrc exports (or a previous test's monkeypatch)

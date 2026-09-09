@@ -193,3 +193,29 @@ def test_cli_backup_does_not_require_an_api_key(tmp_path):
     env["ABUSEIPDB_CACHE_FILE"] = str(tmp_path / "cache.db")
     result = run("--backup", env=env)
     assert result.returncode == 0
+
+
+def test_pruning_tolerates_a_file_that_disappeared_before_removal(make_proxy, tmp_path, monkeypatch):
+    # A backup could disappear between being listed and being removed
+    # (someone manually deleted it, a concurrent --backup run, etc.) --
+    # os.remove() raising in that narrow window must not crash the whole
+    # backup/prune operation.
+    p = make_proxy(ABUSEIPDB_BACKUP_RETENTION="0")
+    backup_dir = str(tmp_path / "backups")
+    os.makedirs(backup_dir)
+    stale = os.path.join(backup_dir, "cache-19990101-000000.json")
+    with open(stale, "w") as f:
+        f.write("{}")
+
+    real_remove = os.remove
+    monkeypatch.setattr(p.os, "remove",
+                         lambda path: (_ for _ in ()).throw(OSError("gone")) if path == stale else real_remove(path))
+
+    result = p.run_backup(backup_dir=backup_dir)  # must not raise -- that's the actual point of
+    # this test: os.remove() failing on the already-vanished file must
+    # not crash the whole backup/prune run.
+
+    # retention=0 means "keep none" -- even the backup just written gets
+    # pruned right back out, same as test_retention_keeps_only_the_configured_count
+    # already covers for the non-error case.
+    assert not os.path.exists(result["backup_path"])

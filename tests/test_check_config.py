@@ -235,3 +235,116 @@ def test_no_report_window_categories_configured_is_silent(proxy):
     # about it either way.
     results = proxy.check_config()
     assert not any("REPORT_WINDOW_CATEGORIES" in msg for _level, msg in results)
+
+
+# --- Additional branches found via coverage analysis ------------------
+
+def test_cache_directory_not_writable_fails(make_proxy, tmp_path, monkeypatch):
+    cache_dir = tmp_path / "cache_dir"
+    cache_dir.mkdir()
+    p = make_proxy(ABUSEIPDB_CACHE_FILE=str(cache_dir / "cache.db"))
+    monkeypatch.setattr(p.os, "access", lambda path, mode: False)
+    results = p.check_config()
+    assert any(level == "fail" and "not writable" in msg for level, msg in results)
+
+
+def test_non_localhost_listen_address_with_protection_is_ok(make_proxy):
+    p = make_proxy(ABUSEIPDB_LISTEN_ADDRESS="0.0.0.0", ABUSEIPDB_SHARED_SECRET="a" * 20,
+                    ABUSEIPDB_DRY_RUN="false")
+    results = p.check_config()
+    assert any(level == "ok" and "extra layer of protection" in msg for level, msg in results)
+
+
+def test_non_localhost_listen_address_without_protection_warns(make_proxy):
+    p = make_proxy(ABUSEIPDB_LISTEN_ADDRESS="0.0.0.0", ABUSEIPDB_DRY_RUN="false")
+    results = p.check_config()
+    assert any(level == "warn" and "trusted network" in msg for level, msg in results)
+
+
+def test_unparseable_allowed_source_ips_fails(make_proxy):
+    p = make_proxy(ABUSEIPDB_ALLOWED_SOURCE_IPS="not-an-ip, also-garbage")
+    results = p.check_config()
+    assert any(level == "fail" and "could be parsed as an IP/CIDR" in msg for level, msg in results)
+
+
+def test_valid_allowed_source_ips_is_ok(make_proxy):
+    p = make_proxy(ABUSEIPDB_ALLOWED_SOURCE_IPS="10.0.0.0/8")
+    results = p.check_config()
+    assert any(level == "ok" and "Source-IP allowlist active" in msg for level, msg in results)
+
+
+def test_short_shared_secret_warns(make_proxy):
+    p = make_proxy(ABUSEIPDB_SHARED_SECRET="short")
+    results = p.check_config()
+    assert any(level == "warn" and "shorter than 16 characters" in msg for level, msg in results)
+
+
+def test_negative_max_concurrent_requests_fails(make_proxy):
+    p = make_proxy(ABUSEIPDB_MAX_CONCURRENT_REQUESTS="-1")
+    results = p.check_config()
+    assert any(level == "fail" and "is invalid" in msg for level, msg in results)
+
+
+def test_zero_max_concurrent_requests_warns(make_proxy):
+    p = make_proxy(ABUSEIPDB_MAX_CONCURRENT_REQUESTS="0")
+    results = p.check_config()
+    assert any(level == "warn" and "no ceiling on concurrent" in msg for level, msg in results)
+
+
+def test_positive_max_concurrent_requests_is_ok(proxy):
+    results = proxy.check_config()
+    assert any(level == "ok" and "Concurrent request ceiling" in msg for level, msg in results)
+
+
+def test_quota_reserve_medium_smaller_than_high_warns(make_proxy):
+    p = make_proxy(ABUSEIPDB_QUOTA_RESERVE_HIGH="100", ABUSEIPDB_QUOTA_RESERVE_MEDIUM="50")
+    results = p.check_config()
+    assert any(level == "warn" and "smaller than" in msg for level, msg in results)
+
+
+def test_skip_whitelisted_in_dry_run_warns(make_proxy):
+    p = make_proxy(ABUSEIPDB_SKIP_WHITELISTED="true", ABUSEIPDB_DRY_RUN="true")
+    results = p.check_config()
+    assert any(level == "warn" and "no effect in --dry-run" in msg for level, msg in results)
+
+
+def test_skip_whitelisted_outside_dry_run_is_ok(make_proxy):
+    p = make_proxy(ABUSEIPDB_SKIP_WHITELISTED="true", ABUSEIPDB_DRY_RUN="false", ABUSEIPDB_API_KEY="x")
+    results = p.check_config()
+    assert any(level == "ok" and "whitelist pre-check active" in msg for level, msg in results)
+
+
+def test_unparseable_comment_scrub_patterns_fails(make_proxy):
+    p = make_proxy(ABUSEIPDB_COMMENT_SCRUB_PATTERNS="(unterminated[")
+    results = p.check_config()
+    assert any(level == "fail" and "could be parsed" in msg and "regex" in msg for level, msg in results)
+
+
+def test_valid_comment_scrub_patterns_is_ok(make_proxy):
+    p = make_proxy(ABUSEIPDB_COMMENT_SCRUB_PATTERNS=r"\d+\.\d+\.\d+\.\d+")
+    results = p.check_config()
+    assert any(level == "ok" and "Comment scrubbing active" in msg for level, msg in results)
+
+
+def test_fallback_key_identical_to_primary_warns(make_proxy):
+    p = make_proxy(ABUSEIPDB_API_KEY="same-key", ABUSEIPDB_API_KEY_FALLBACK="same-key")
+    results = p.check_config()
+    assert any(level == "warn" and "identical to ABUSEIPDB_API_KEY" in msg for level, msg in results)
+
+
+def test_fallback_key_configured_is_ok(make_proxy):
+    p = make_proxy(ABUSEIPDB_API_KEY="primary-key", ABUSEIPDB_API_KEY_FALLBACK="different-key")
+    results = p.check_config()
+    assert any(level == "ok" and msg == "Fallback API key configured" for level, msg in results)
+
+
+def test_reconciliation_configured_is_ok(make_proxy):
+    p = make_proxy(ABUSEIPDB_CROWDSEC_BOUNCER_KEY="test-bouncer-key")
+    results = p.check_config()
+    assert any(level == "ok" and "Reconciliation configured" in msg for level, msg in results)
+
+
+def test_quota_reservation_active_is_ok(make_proxy):
+    p = make_proxy(ABUSEIPDB_QUOTA_RESERVE_HIGH="50", ABUSEIPDB_QUOTA_RESERVE_MEDIUM="100")
+    results = p.check_config()
+    assert any(level == "ok" and "Quota reservation active" in msg for level, msg in results)

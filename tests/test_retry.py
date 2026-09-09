@@ -1,4 +1,5 @@
 """send_with_retry() / send_report_api(): retry, backoff, give-up alert."""
+import pytest
 
 
 def test_dry_run_never_calls_the_real_api(proxy, monkeypatch):
@@ -436,3 +437,71 @@ class TestRetryBacklogWarning:
         proxy._reap_orphaned_timers()  # age now exceeds the 0s threshold
 
         assert len(calls) == 1
+
+
+def test_resume_state_arms_pending_and_logs_counts(proxy, fake_timer, capsys):
+    proxy.save_cache({
+        "reports": {},
+        "pending": {"1.2.3.4": {"due_time": 999999999999, "severity": 2, "categories": "18", "comment": "x"}},
+        "retry_queue": {"5.6.7.8": {"due_time": 999999999999, "categories": "15", "comment": "y", "attempts": 1}},
+    })
+
+    proxy.resume_state_from_cache()
+
+    assert "1.2.3.4" in proxy.pending_timers
+    assert "5.6.7.8" in proxy.retry_timers
+    captured = capsys.readouterr().err
+    assert "Resumed 1 pending escalation report(s)" in captured
+    assert "Resumed 1 queued retry/retries" in captured
+
+
+# --- _orphan_rescan_loop() / _source_ip_rate_limit_prune_loop() -- the
+# periodic background loops themselves (their inner logic is unit-tested
+# elsewhere; this exercises the actual `while True: sleep(); try: ...`
+# bodies, using the same controlled-break-out-via-sleep-mock pattern as
+# _summary_loop()'s tests) --------------------------------------------
+
+class _StopLoop(Exception):
+    pass
+
+
+def test_orphan_rescan_loop_calls_reap_and_recovers_from_an_exception(proxy, monkeypatch, capsys):
+    calls = {"n": 0}
+
+    def fake_sleep(seconds):
+        calls["n"] += 1
+        if calls["n"] > 2:
+            raise _StopLoop()
+
+    def failing_reap():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(proxy.time, "sleep", fake_sleep)
+    monkeypatch.setattr(proxy, "_reap_orphaned_timers", failing_reap)
+
+    with pytest.raises(_StopLoop):
+        proxy._orphan_rescan_loop()
+
+    assert "Orphaned pending/retry rescan failed: boom" in capsys.readouterr().err
+    assert calls["n"] == 3  # kept looping past the exception, not crashed
+
+
+def test_source_ip_rate_limit_prune_loop_calls_prune_and_recovers_from_an_exception(proxy, monkeypatch, capsys):
+    calls = {"n": 0}
+
+    def fake_sleep(seconds):
+        calls["n"] += 1
+        if calls["n"] > 2:
+            raise _StopLoop()
+
+    def failing_prune():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(proxy.time, "sleep", fake_sleep)
+    monkeypatch.setattr(proxy, "_prune_source_ip_rate_limit_state", failing_prune)
+
+    with pytest.raises(_StopLoop):
+        proxy._source_ip_rate_limit_prune_loop()
+
+    assert "Source-ip rate limit state prune failed: boom" in capsys.readouterr().err
+    assert calls["n"] == 3

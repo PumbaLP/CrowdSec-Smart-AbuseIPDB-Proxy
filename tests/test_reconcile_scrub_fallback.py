@@ -431,3 +431,18 @@ def test_reconcile_orphaned_retry_gets_reaped_by_a_separately_running_process(
         fake_timer.instances.pop(0).fire()
 
     assert "9.9.9.9" not in p_service.load_cache()["reports"]
+
+
+def test_reconcile_skips_a_whitelisted_ip(make_proxy):
+    p = make_proxy(ABUSEIPDB_CROWDSEC_BOUNCER_KEY="test-bouncer-key")
+    p.fetch_crowdsec_active_decisions = lambda: [
+        ("2.2.2.2", "crowdsecurity/ssh-bf"),
+        ("8.8.8.8", "crowdsecurity/ssh-bf"),
+    ]
+    p.is_whitelisted = lambda ip: ip == "8.8.8.8"
+
+    result = p.run_reconcile()
+
+    assert result["skipped_ignored_or_whitelisted"] == 1
+    assert result["reconciled"] == ["2.2.2.2"]
+    assert "8.8.8.8" not in p.load_cache()["reports"]
